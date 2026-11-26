@@ -87,7 +87,8 @@ _NET_RULES: list[tuple[str, str]] = [
     ("tbs", r"\btbs\b"),
     ("trutv", r"\btru\s*tv\b"),
     ("peacock", r"\bpeacock\b"),
-    ("prime", r"\bprime\s+video\b|\bamazon\b"),
+    ("netflix", r"\bnetflix\b"),
+    ("prime", r"\bprime\s+video\b|\bamazon\s+prime\b|\bprime\s+video\b"),
     ("espn", r"\bespn\b"),
     ("abc", r"\babc\b"),
     ("cbs", r"\bcbs\b"),
@@ -135,6 +136,8 @@ _EXACT = {
     "peacock": "peacock",
     "prime video": "prime",
     "amazon": "prime",
+    "amazon prime": "prime",
+    "netflix": "netflix",
     "nesn": "nesn",
     "yes": "yes",
     "msg": "msg",
@@ -291,6 +294,8 @@ class SportsStats:
     subtitled: int = 0
     event_from_name: int = 0
     event_from_slate: int = 0
+    affiliate_generic_remaining: int = 0
+    subtitle_duplicates: int = 0
     samples: list[tuple[str, str, str]] = field(default_factory=list)
 
 
@@ -705,54 +710,216 @@ def load_games(cache: Path, window_start: datetime, window_end: datetime,
     return games
 
 
-def match_game(networks: set[str], league: str | None, start: datetime,
-               games: list[Game], *, allow_any_league: bool = False) -> Game | None:
+# Nicknames whose metro is not the ESPN city name. Used only to break a tie
+# when several games share one network.
+_NICK_METRO = {
+    "titans": ["nashville"],
+    "packers": ["green bay"],
+    "patriots": ["boston", "new england"],
+    "commanders": ["washington"],
+    "49ers": ["san francisco", "bay area"],
+    "raiders": ["las vegas", "vegas"],
+    "cardinals": ["phoenix"],
+    "chargers": ["los angeles"],
+    "rams": ["los angeles"],
+    "giants": ["new york"],
+    "jets": ["new york"],
+    "warriors": ["san francisco", "bay area"],
+    "clippers": ["los angeles"],
+    "lakers": ["los angeles"],
+    "nets": ["brooklyn"],
+    "knicks": ["new york"],
+}
+
+
+def _short_team(name: str) -> str:
+    parts = (name or "").split()
+    if not parts:
+        return name
+    nick = parts[-1]
+    if nick.lower() in {"state", "tech", "a&m", "university", "college"} or len(nick) < 4:
+        return name
+    return nick
+
+
+def _sub_ok(title: str, sub: str) -> str:
+    """TiviMate joins title and sub-title, so the sub-title must not repeat the title."""
+    sub = (sub or "").strip()
+    title = (title or "").strip()
+    if not sub or not title:
+        return ""
+    tl, sl = title.lower(), sub.lower()
+    if sl == tl or sl in tl or tl in sl:
+        return ""
+    return sub
+
+
+def _venues(games: list[Game]) -> str:
+    seen: list[str] = []
+    for game in games:
+        if game.venue and game.venue not in seen:
+            seen.append(game.venue)
+    return "; ".join(seen)
+
+
+def games_title(games: list[Game]) -> str:
+    if len(games) == 1:
+        return games[0].title
+    parts = [f"{_short_team(g.away)} at {_short_team(g.home)}" for g in games[:5]]
+    text = f"{games[0].label}: " + " / ".join(parts)
+    if len(games) > 5:
+        text += " / ..."
+    return text
+
+
+def _market_hit(game: Game, channel_name: str) -> bool:
+    text = _norm(channel_name)
+    if not text:
+        return False
+    for side in (game.away, game.home):
+        side_n = _norm(side)
+        if len(side_n) >= 4 and side_n in text:
+            return True
+        parts = side_n.split()
+        if len(parts) >= 2:
+            city = " ".join(parts[:-1])
+            nick = parts[-1]
+            if len(city) >= 4 and city in text:
+                return True
+            if len(nick) >= 5 and re.search(rf"\b{re.escape(nick)}\b", text):
+                return True
+            for metro in _NICK_METRO.get(nick, []):
+                if metro in text:
+                    return True
+    return False
+
+
+def match_games(networks: set[str], league: str | None, start: datetime,
+                stop: datetime | None, games: list[Game],
+                *, allow_any_league: bool = False) -> list[Game]:
+    """Games on this network within 60 minutes of the listing, or inside it."""
     if start is None or not networks:
-        return None
+        return []
     if league is None and not allow_any_league:
-        return None
-    window = timedelta(minutes=30)
+        return []
+    window = timedelta(minutes=60)
     found: list[Game] = []
+    seen: set[tuple] = set()
     for game in games:
         if league and game.league != league:
             continue
-        if abs(game.start - start) > window:
-            continue
         if not game.networks or not (networks & game.networks):
             continue
+        near = abs(game.start - start) <= window
+        inside = stop is not None and start <= game.start <= stop
+        if not near and not inside:
+            continue
+        key = (game.league, game.away, game.home, game.start)
+        if key in seen:
+            continue
+        seen.add(key)
         found.append(game)
-    if not found:
-        return None
-    found.sort(key=lambda g: abs((g.start - start).total_seconds()))
-    if len(found) > 1:
-        gap = abs((found[1].start - start).total_seconds()) - abs((found[0].start - start).total_seconds())
-        if gap < 60:
-            return None
-    return found[0]
+    found.sort(key=lambda g: (g.start, g.away, g.home))
+    return found
 
 
-def _retitle(prog: dict, game: Game) -> dict:
+def choose_games(found: list[Game], channel_name: str) -> list[Game]:
+    """Prefer the game whose team or city is in the channel name; otherwise keep the window."""
+    if len(found) <= 1:
+        return found
+    marketed = [g for g in found if _market_hit(g, channel_name)]
+    if marketed and len(marketed) < len(found):
+        return marketed
+    return found
+
+
+def _describe(original: str, games: list[Game]) -> str:
+    original = (original or "").strip()
+    venues = _venues(games)
+    if original and venues:
+        return f"{original} — {venues}"
+    return original or venues
+
+
+def _retitle(prog: dict, games: list[Game]) -> dict:
     updated = dict(prog)
-    original = (prog.get("title") or "").strip()
-    venue = game.venue
-    desc = original
-    if venue:
-        desc = f"{original} — {venue}" if original else venue
-    updated["title"] = game.title
-    updated["desc"] = desc
-    updated["sub"] = game.matchup
+    title = games_title(games)
+    updated["title"] = title
+    updated["desc"] = _describe(prog.get("title") or "", games)
+    venue = games[0].venue if len(games) == 1 else ""
+    updated["sub"] = _sub_ok(title, venue)
     updated["event"] = True
     return updated
 
 
-def _subtitle(prog: dict, game: Game) -> dict:
+def _subtitle(prog: dict, games: list[Game]) -> dict:
     updated = dict(prog)
-    updated["sub"] = game.matchup
-    if game.venue and game.venue not in (updated.get("desc") or ""):
+    title = (prog.get("title") or "").strip()
+    matchup = games[0].matchup if len(games) == 1 else games_title(games)
+    sub = _sub_ok(title, matchup)
+    if not sub:
+        updated["sub"] = _sub_ok(title, prog.get("sub") or "")
+        return updated
+    updated["sub"] = sub
+    venues = _venues(games)
+    if venues and venues.lower() not in (updated.get("desc") or "").lower():
         existing = (updated.get("desc") or "").strip()
-        updated["desc"] = f"{existing} — {game.venue}" if existing else game.venue
+        updated["desc"] = f"{existing} — {venues}" if existing else venues
     updated["event"] = True
     return updated
+
+
+def _overlap_seconds(a: dict, b: dict) -> float:
+    start = max(a["start"], b["start"])
+    stop = min(a["stop"], b["stop"])
+    return max(0.0, (stop - start).total_seconds())
+
+
+def dedupe_programmes(items: list[dict]) -> list[dict]:
+    """Drop a second listing of the same slot, and a generic title under a specific one."""
+    ordered = sorted(items, key=lambda p: (p["start"], -(p["stop"] - p["start"]).total_seconds()))
+    kept: list[dict] = []
+    for prog in ordered:
+        drop = False
+        for index, prev in enumerate(kept):
+            overlap = _overlap_seconds(prev, prog)
+            gap = (prog["start"] - prev["stop"]).total_seconds()
+            same_start = abs((prog["start"] - prev["start"]).total_seconds()) <= 5 * 60
+            touches = overlap >= 15 * 60 or (same_start and overlap >= 60)
+            abuts = 0 <= gap <= 60
+            if not touches and not abuts:
+                continue
+            ta = (prev.get("title") or "").strip()
+            tb = (prog.get("title") or "").strip()
+            same = ta.lower() == tb.lower() or (ta and tb and (ta.lower() in tb.lower() or tb.lower() in ta.lower()))
+            generic_under = (
+                touches
+                and generic_league(tb) is not None
+                and generic_league(ta) is None
+                and title_league(tb) is not None
+                and title_league(tb) == title_league(ta)
+            )
+            if not same and not generic_under:
+                continue
+            if same and (prog["stop"] - prog["start"]) > (prev["stop"] - prev["start"]):
+                merged = dict(prog)
+                merged["start"] = min(prev["start"], prog["start"])
+                merged["stop"] = max(prev["stop"], prog["stop"])
+                merged["start_s"] = _xmltv(merged["start"])
+                merged["stop_s"] = _xmltv(merged["stop"])
+                merged["sub"] = _sub_ok(merged.get("title") or "", merged.get("sub") or "")
+                kept[index] = merged
+            elif same and (abuts or touches):
+                prev["stop"] = max(prev["stop"], prog["stop"])
+                prev["start"] = min(prev["start"], prog["start"])
+                prev["start_s"] = _xmltv(prev["start"])
+                prev["stop_s"] = _xmltv(prev["stop"])
+            drop = True
+            break
+        if not drop:
+            kept.append(prog)
+    kept.sort(key=lambda p: p["start"])
+    return kept
 
 
 def apply_sports_titles(playlist: list[dict], progs: dict[str, list[dict]],
@@ -784,27 +951,91 @@ def apply_sports_titles(playlist: list[dict], progs: dict[str, list[dict]],
                 league = title_league(title)
                 if league is None and not re.search(r"\bvs\.?\b", title, re.I):
                     continue
-            game = match_game(
+            found = match_games(
                 nets,
                 league,
                 prog.get("start"),
+                prog.get("stop"),
                 games,
                 allow_any_league=not generic and league is None,
             )
-            if game is None:
+            chosen = choose_games(found, ch["name"])
+            if not chosen:
                 continue
             if generic:
-                items[index] = _retitle(prog, game)
+                items[index] = _retitle(prog, chosen)
                 stats.retitled += 1
-                if game.league not in seen_leagues or len(stats.samples) < 8:
-                    seen_leagues.add(game.league)
+                when = prog["start"].astimezone(TZ).strftime("%Y-%m-%d %H:%M %Z")
+                nashville = (
+                    "nashville" in ch["name"].lower()
+                    and re.search(r"\b(fox|cbs)\b", ch["name"], re.I)
+                    and prog["start"].astimezone(TZ).date().isoformat() == "2026-11-26"
+                )
+                if nashville:
+                    stats.samples.insert(0, (ch["name"], when, items[index]["title"]))
+                elif chosen[0].league not in seen_leagues or len(stats.samples) < 8:
+                    seen_leagues.add(chosen[0].league)
                     if len(stats.samples) < 12:
-                        when = prog["start"].astimezone(TZ).strftime("%Y-%m-%d %H:%M %Z")
-                        stats.samples.append((ch["name"], when, game.title))
+                        stats.samples.append((ch["name"], when, items[index]["title"]))
             else:
-                items[index] = _subtitle(prog, game)
-                stats.subtitled += 1
+                updated = _subtitle(prog, chosen)
+                if updated is not prog and updated.get("sub"):
+                    items[index] = updated
+                    stats.subtitled += 1
+                else:
+                    items[index] = dict(prog)
+                    items[index]["sub"] = _sub_ok(prog.get("title") or "", prog.get("sub") or "")
+        scrubbed = []
+        for prog in items:
+            prog = dict(prog)
+            prog["sub"] = _sub_ok(prog.get("title") or "", prog.get("sub") or "")
+            scrubbed.append(prog)
+        progs[cid] = dedupe_programmes(scrubbed)
     return stats
+
+
+def scrub_subtitles(progs: dict[str, list[dict]]) -> int:
+    """Clear any sub-title that repeats its title. Returns how many were cleared."""
+    cleared = 0
+    for cid, items in progs.items():
+        for prog in items:
+            old = prog.get("sub") or ""
+            prog["sub"] = _sub_ok(prog.get("title") or "", old)
+            if old and not prog["sub"]:
+                cleared += 1
+    return cleared
+
+
+def count_listing_issues(playlist: list[dict], progs: dict[str, list[dict]]) -> tuple[int, int]:
+    """Remaining generic titles on ABC/NBC/CBS/FOX for Nov 25-29, and title/sub duplicates."""
+    names = {}
+    for ch in playlist:
+        names.setdefault(ch["id"], ch["name"])
+    generic = 0
+    dupes = 0
+    seen: set[str] = set()
+    start = datetime(2026, 11, 25, tzinfo=TZ)
+    end = datetime(2026, 11, 30, tzinfo=TZ)
+    for cid, items in progs.items():
+        if cid in seen:
+            continue
+        seen.add(cid)
+        name = names.get(cid, "")
+        nets = network_ids(name)
+        affiliate = bool(nets & {"abc", "nbc", "cbs", "fox"})
+        for prog in items:
+            title = prog.get("title") or ""
+            sub = prog.get("sub") or ""
+            if sub and not _sub_ok(title, sub):
+                dupes += 1
+            if not affiliate or prog.get("placeholder"):
+                continue
+            when = prog.get("start")
+            if when is None or not (start <= when.astimezone(TZ) < end):
+                continue
+            if generic_league(title):
+                generic += 1
+    return generic, dupes
 
 
 def _gaps(cid: str, events: list[dict], start: datetime, end: datetime) -> list[dict]:
@@ -876,7 +1107,7 @@ def event_programmes(ch: dict, games: list[Game], now: datetime,
                     cid, game.start, game.start + timedelta(hours=3),
                     game.title,
                     f"{game.title} — {game.venue}" if game.venue else game.title,
-                    sub=game.matchup, event=True,
+                    sub=_sub_ok(game.title, game.venue), event=True,
                 )
                 if any(_overlaps(prog["start"], prog["stop"], prev) for prev in chosen):
                     continue

@@ -1376,6 +1376,12 @@ def main(argv: list[str] | None = None) -> int:
         progs[ch["id"]] = blocks
         ch["epg_source"] = "placeholder"
         n_placeholder_ch += 1
+    sports_schedule.scrub_subtitles(progs)
+    generic_left, sub_dupes = sports_schedule.count_listing_issues(playlist, progs)
+    sports_stats.affiliate_generic_remaining = generic_left
+    sports_stats.subtitle_duplicates = sub_dupes
+    log(f"  ABC/NBC/CBS/FOX generic titles left Nov 25-29: {generic_left:,}; "
+        f"title/sub-title duplicates: {sub_dupes:,}")
 
     # Inherit epg_source onto rows that share a legitimate id
     best_src: dict[str, str] = {}
@@ -1535,6 +1541,9 @@ def main(argv: list[str] | None = None) -> int:
     lines.append("Provider snapshot programmes were kept only when their start is still in the future.")
     lines.append(f"Sports programmes retitled with a public matchup: {sports_stats.retitled:,}")
     lines.append(f"Sports programmes given a matchup sub-title: {sports_stats.subtitled:,}")
+    lines.append("ABC/NBC/CBS/FOX generic titles still left "
+                 f"(Nov 25-29): {sports_stats.affiliate_generic_remaining:,}")
+    lines.append(f"Title/sub-title duplicates: {sports_stats.subtitle_duplicates:,}")
     lines.append(f"Event channels scheduled from the channel name: {sports_stats.event_from_name:,}")
     lines.append("Event channels filled from that day's public slate "
                  f"(best guess, game 1 on channel 01): {sports_stats.event_from_slate:,}")
