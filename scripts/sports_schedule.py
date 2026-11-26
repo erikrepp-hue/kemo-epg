@@ -177,8 +177,8 @@ _STUDIO_RE = re.compile(
     r"scoreboard|pre-?game|post-?game|\btoday\b|\bfinal\b|highlights|stories|"
     r"preview|legends|mornings|goal\s*zone|\bcentral\b|podcast|\bshow\b|"
     r"\bstudio\b|\bwrap\b|bitesize|icons|reload|netbusters|fan'?s vote|"
-    r"big interview|game\s*night|countdown|kickoff|\bpresented\b|"
-    r"football saturday|saturday night'?s main",
+    r"big interview|game\s*night|football night|night in america|countdown|kickoff|\bpresented\b|"
+    r"football saturday|saturday night'?s main|\bpregame\b|\bpostgame\b",
     re.I,
 )
 _LIVE_RE = re.compile(r"^(?:live\s*[:\-]\s*|live\s+)", re.I)
@@ -296,6 +296,7 @@ class SportsStats:
     event_from_slate: int = 0
     affiliate_generic_remaining: int = 0
     subtitle_duplicates: int = 0
+    league_pack: dict = field(default_factory=dict)
     samples: list[tuple[str, str, str]] = field(default_factory=list)
 
 
@@ -344,12 +345,37 @@ def is_studio_show(title: str) -> bool:
     return bool(_STUDIO_RE.search(title or ""))
 
 
+_BARE_SPORT = {
+    "football": ["nfl", "ncaaf"],
+    "basketball": ["nba", "ncaam"],
+    "hockey": ["nhl"],
+    "baseball": ["mlb"],
+}
+
+
+def candidate_leagues(title: str) -> list[str]:
+    """Leagues a still-generic title might be. Empty for studio shows and real matchups."""
+    if not title or is_studio_show(title):
+        return []
+    if re.search(r"\b(?:vs\.?|@)\b", title) or re.search(r"\bat\b", _core_title(title), re.I):
+        # "Team at Team" is already a matchup. "Live at 7" is not a title we generate.
+        if re.search(r"\bvs\.?\b", title) or re.search(r".+\sat\s+\S+", title):
+            return []
+    core = _core_title(title).lower().replace("'", "'")
+    if core in _GENERIC_CORE:
+        return [_GENERIC_CORE[core]]
+    if core in _BARE_SPORT:
+        return list(_BARE_SPORT[core])
+    for phrase, league in sorted(_GENERIC_CORE.items(), key=lambda kv: -len(kv[0])):
+        if core == phrase or core.startswith(phrase + " ") or core.startswith(phrase + ":"):
+            return [league]
+    return []
+
+
 def generic_league(title: str) -> str | None:
     """League id when the title is only a generic game name, else None."""
-    if not title or is_studio_show(title):
-        return None
-    core = _core_title(title).lower().replace("'", "'")
-    return _GENERIC_CORE.get(core)
+    leagues = candidate_leagues(title)
+    return leagues[0] if len(leagues) == 1 else None
 
 
 def title_league(title: str) -> str | None:
@@ -714,7 +740,7 @@ def load_games(cache: Path, window_start: datetime, window_end: datetime,
 # when several games share one network.
 _NICK_METRO = {
     "titans": ["nashville"],
-    "packers": ["green bay"],
+    "packers": ["green bay", "milwaukee", "wisconsin"],
     "patriots": ["boston", "new england"],
     "commanders": ["washington"],
     "49ers": ["san francisco", "bay area"],
@@ -794,8 +820,22 @@ def _market_hit(game: Game, channel_name: str) -> bool:
     return False
 
 
+_STREAM_NFL = {"netflix", "prime", "peacock"}
+_BROADCAST = {"abc", "cbs", "nbc", "fox"}
+
+
+def _game_on_channel(game: Game, networks: set[str], channel_name: str) -> bool:
+    if game.networks & networks:
+        return True
+    # Netflix / Prime / Peacock NFL still airs on the home and away stations' locals.
+    if (game.league == "nfl" and game.networks & _STREAM_NFL and networks & _BROADCAST
+            and _market_hit(game, channel_name)):
+        return True
+    return False
+
+
 def match_games(networks: set[str], league: str | None, start: datetime,
-                stop: datetime | None, games: list[Game],
+                stop: datetime | None, games: list[Game], channel_name: str = "",
                 *, allow_any_league: bool = False) -> list[Game]:
     """Games on this network within 60 minutes of the listing, or inside it."""
     if start is None or not networks:
@@ -808,7 +848,7 @@ def match_games(networks: set[str], league: str | None, start: datetime,
     for game in games:
         if league and game.league != league:
             continue
-        if not game.networks or not (networks & game.networks):
+        if not _game_on_channel(game, networks, channel_name):
             continue
         near = abs(game.start - start) <= window
         inside = stop is not None and start <= game.start <= stop
@@ -819,7 +859,7 @@ def match_games(networks: set[str], league: str | None, start: datetime,
             continue
         seen.add(key)
         found.append(game)
-    found.sort(key=lambda g: (g.start, g.away, g.home))
+    found.sort(key=lambda g: (abs((g.start - start).total_seconds()), g.start, g.away))
     return found
 
 
@@ -943,22 +983,30 @@ def apply_sports_titles(playlist: list[dict], progs: dict[str, list[dict]],
             if prog.get("placeholder"):
                 continue
             title = prog.get("title") or ""
-            league = generic_league(title)
-            generic = league is not None
+            leagues = candidate_leagues(title)
+            generic = bool(leagues)
             if not generic:
                 if is_studio_show(title):
                     continue
                 league = title_league(title)
                 if league is None and not re.search(r"\bvs\.?\b", title, re.I):
                     continue
-            found = match_games(
-                nets,
-                league,
-                prog.get("start"),
-                prog.get("stop"),
-                games,
-                allow_any_league=not generic and league is None,
-            )
+                leagues = [league] if league else [None]
+            found: list[Game] = []
+            for league in leagues:
+                found.extend(match_games(
+                    nets,
+                    league,
+                    prog.get("start"),
+                    prog.get("stop"),
+                    games,
+                    ch["name"],
+                    allow_any_league=league is None,
+                ))
+            if len(leagues) > 1 and found:
+                found.sort(key=lambda g: abs((g.start - prog["start"]).total_seconds()))
+                best = found[0].league
+                found = [g for g in found if g.league == best]
             chosen = choose_games(found, ch["name"])
             if not chosen:
                 continue
@@ -1033,7 +1081,7 @@ def count_listing_issues(playlist: list[dict], progs: dict[str, list[dict]]) -> 
             when = prog.get("start")
             if when is None or not (start <= when.astimezone(TZ) < end):
                 continue
-            if generic_league(title):
+            if candidate_leagues(title):
                 generic += 1
     return generic, dupes
 
@@ -1116,3 +1164,211 @@ def event_programmes(ch: dict, games: list[Game], now: datetime,
         else:
             source = "event-name"
     return _gaps(cid, chosen, window_start, window_end), source
+
+
+_PACKAGE_LEAGUE = {
+    "usa nba": "nba",
+    "usa nhl": "nhl",
+}
+
+
+def package_league(category: str) -> str | None:
+    key = _norm(category)
+    if key in _PACKAGE_LEAGUE:
+        return _PACKAGE_LEAGUE[key]
+    if "sunday ticket" in key or "game pass" in key or "league pass" in key and "nba" in key:
+        return "nfl" if "nfl" in key or "sunday" in key or "game pass" in key else "nba"
+    if "center ice" in key:
+        return "nhl"
+    if "league pass" in key:
+        return "nba"
+    return None
+
+
+def _dedupe_games(games: list[Game]) -> list[Game]:
+    out: list[Game] = []
+    seen: set[tuple] = set()
+    for game in sorted(games, key=lambda g: (g.start, g.away, g.home)):
+        key = (game.league, game.away, game.home, game.start)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(game)
+    return out
+
+
+def _has_real_matchup(items: list[dict]) -> bool:
+    for prog in items or []:
+        if prog.get("placeholder"):
+            continue
+        title = prog.get("title") or ""
+        if title and title != "No event scheduled" and " at " in title:
+            return True
+    return False
+
+
+def _slot_rank(name: str, peers: list[str]) -> int | None:
+    nums = []
+    for peer in peers:
+        found = [int(n) for n in re.findall(r"\b(\d{1,4})\b", peer)]
+        if found:
+            nums.append(found[-1])
+    mine = [int(n) for n in re.findall(r"\b(\d{1,4})\b", name or "")]
+    if not mine or not nums:
+        return None
+    num = mine[-1]
+    ordered = sorted(set(nums))
+    if num not in ordered:
+        return None
+    # Small indexes are already the game number. Large Sunday Ticket numbers
+    # are ranked among themselves so 705 is game 1.
+    if num <= 40:
+        return num
+    return ordered.index(num) + 1
+
+
+def _night_games(name: str, games: list[Game], league: str,
+                 start: datetime, end: datetime) -> list[Game]:
+    text = _norm(name)
+    weekday = None
+    prefer: set[str] = set()
+    if "monday night" in text:
+        weekday, prefer = 0, {"prime", "espn", "abc"}
+    elif "thursday night" in text:
+        weekday, prefer = 3, {"prime", "fox", "nfl-net", "amazon"}
+    elif "sunday night" in text:
+        weekday, prefer = 6, {"nbc", "prime", "espn"}
+    if weekday is None:
+        return []
+    night = []
+    for game in games:
+        if game.league != league:
+            continue
+        if game.start + timedelta(hours=3) <= start or game.start >= end:
+            continue
+        if game.start.astimezone(TZ).weekday() != weekday:
+            continue
+        night.append(game)
+    preferred = [g for g in night if g.networks & prefer]
+    return _dedupe_games(preferred or night[:1])
+
+
+def _indexed_games(rank: int, games: list[Game], league: str,
+                   start: datetime, end: datetime) -> list[Game]:
+    by_day: dict = {}
+    for game in games:
+        if game.league != league:
+            continue
+        if game.start + timedelta(hours=3) <= start or game.start >= end:
+            continue
+        by_day.setdefault(game.start.astimezone(TZ).date(), []).append(game)
+    chosen = []
+    for day in sorted(by_day):
+        slate = _dedupe_games(by_day[day])
+        if rank <= len(slate):
+            chosen.append(slate[rank - 1])
+    return chosen
+
+
+def fill_league_packages(playlist: list[dict], progs: dict[str, list[dict]],
+                         games: list[Game], now: datetime, window_end: datetime,
+                         stats: SportsStats) -> None:
+    """Give every NBA, NHL, and NFL package channel that league's games.
+
+    A team or RSN in the channel name gets that team's game. Otherwise
+    channel 01 (or the first Sunday Ticket number) gets game 1.
+    """
+    window_start = now - timedelta(hours=3)
+    groups: dict[str, list[dict]] = {}
+    for ch in playlist:
+        league = package_league(ch.get("category") or "")
+        if league:
+            groups.setdefault(ch["category"], []).append(ch)
+    report = {}
+    for category, members in groups.items():
+        league = package_league(category)
+        names = [ch["name"] for ch in members]
+        with_matchup = 0
+        with_programmes = 0
+        for ch in members:
+            items = progs.get(ch["id"]) or []
+            if any(not p.get("placeholder") and (p.get("title") or "") not in ("", "No event scheduled") for p in items):
+                with_programmes += 1
+            if _has_real_matchup(items):
+                with_matchup += 1
+                continue
+            selected = _dedupe_games(
+                g for g in games
+                if g.league == league
+                and g.start < window_end
+                and g.start + timedelta(hours=3) > window_start
+                and _market_hit(g, ch["name"])
+            )
+            if not selected:
+                selected = _night_games(ch["name"], games, league, window_start, window_end)
+            if not selected:
+                rank = _slot_rank(ch["name"], names)
+                if rank:
+                    selected = _indexed_games(rank, games, league, window_start, window_end)
+            if not selected and not items:
+                progs[ch["id"]] = _gaps(ch["id"], [], window_start, window_end)
+                ch["epg_source"] = "league-pack"
+                continue
+            if not selected:
+                continue
+            blocks = []
+            for game in selected:
+                title = game.title
+                blocks.append(_programme(
+                    ch["id"], game.start, game.start + timedelta(hours=3),
+                    title,
+                    f"{title} — {game.venue}" if game.venue else title,
+                    sub=_sub_ok(title, game.venue), event=True,
+                ))
+            progs[ch["id"]] = _gaps(ch["id"], blocks, window_start, window_end)
+            ch["epg_source"] = "league-pack"
+            if _has_real_matchup(progs[ch["id"]]):
+                with_matchup += 1
+            if any(not p.get("placeholder") for p in progs[ch["id"]]):
+                with_programmes += 1
+            if len(stats.samples) < 20 and blocks:
+                when = blocks[0]["start"].astimezone(TZ).strftime("%Y-%m-%d %H:%M %Z")
+                stats.samples.append((ch["name"], when, blocks[0]["title"]))
+        report[category] = {
+            "channels": len(members),
+            "with_programmes": with_programmes,
+            "with_matchup": with_matchup,
+        }
+    stats.league_pack = report
+
+
+def add_playlist_id_aliases(playlist: list[dict], progs: dict[str, list[dict]]) -> int:
+    """Publish league-package rows under both the playlist id and the display name.
+
+    TiviMate uses the tvg-id when the playlist has one, otherwise the channel name.
+    The snapshot stores generated slugs for these channels, so either one may be
+    what the playlist actually sends.
+    """
+    seen = {ch["id"] for ch in playlist}
+    extras = []
+    for ch in playlist:
+        if not package_league(ch.get("category") or ""):
+            continue
+        aliases = []
+        raw = re.sub(r"~\d+$", "", ch.get("stored_id") or "")
+        if raw and raw != ch["id"]:
+            aliases.append(raw)
+        if ch.get("name") and ch["name"] != ch["id"]:
+            aliases.append(ch["name"])
+        for alias in aliases:
+            if alias in seen:
+                if not progs.get(alias) and progs.get(ch["id"]):
+                    progs[alias] = list(progs[ch["id"]])
+                continue
+            seen.add(alias)
+            clone = dict(ch)
+            clone["id"] = alias
+            extras.append(clone)
+            progs[alias] = list(progs.get(ch["id"]) or [])
+    playlist.extend(extras)
+    return len(extras)

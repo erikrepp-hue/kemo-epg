@@ -1376,6 +1376,10 @@ def main(argv: list[str] | None = None) -> int:
         progs[ch["id"]] = blocks
         ch["epg_source"] = "placeholder"
         n_placeholder_ch += 1
+    sports_schedule.fill_league_packages(playlist, progs, games, now, ph_end, sports_stats)
+    for cat, info in sports_stats.league_pack.items():
+        log(f"  {cat}: {info['with_matchup']:,} of {info['channels']:,} channels have a matchup "
+            f"({info['with_programmes']:,} have programmes)")
     sports_schedule.scrub_subtitles(progs)
     generic_left, sub_dupes = sports_schedule.count_listing_issues(playlist, progs)
     sports_stats.affiliate_generic_remaining = generic_left
@@ -1419,6 +1423,8 @@ def main(argv: list[str] | None = None) -> int:
     csv_path = outdir / "match-report.csv"
     sum_path = outdir / "SUMMARY.txt"
 
+    n_alias = sports_schedule.add_playlist_id_aliases(playlist, progs)
+    log(f"  also publishing {n_alias:,} playlist tvg-id/name aliases so TiviMate can match either")
     log("Writing XMLTV")
     write_xmltv(xml_path, playlist, progs, "Kemo custom EPG (snapshot)")
 
