@@ -22,14 +22,19 @@ public XMLTV (epgshare01 US/UK/CA/locals/sports, i.mjh.nz Samsung/Pluto,
 Ireland). Matching prefers precision over recall. Logos come from
 tv-logo/tv-logos, then iptv-org, then a safe playlist image URL.
 
-Event / PPV / 24/7 channels with no real schedule get 2-hour placeholder
-blocks titled with the channel name and desc "No guide data".
+Generic sports titles on network channels are matched to the public ESPN
+scoreboard (league + network + start within 30 minutes) and retitled with the
+teams. Numbered event / PPV channels use a matchup in the channel name when
+there is one; otherwise a single-league slot is a best-guess lineup of that
+day's games. Other 24/7 channels with no schedule still get 2-hour
+placeholders titled with the channel name and desc "No guide data".
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import sports_schedule
 import gzip
 import io
 import json
@@ -1340,11 +1345,30 @@ def main(argv: list[str] | None = None) -> int:
         elif added and "+" not in ch["epg_source"] and ch["epg_source"] != sname:
             ch["epg_source"] = f"{ch['epg_source']}+{sname}"
 
-    # Placeholders for event/PPV/24/7 with no real data
+    log("Loading public scoreboards")
+    games = sports_schedule.load_games(cache, window_start, window_end, args.refresh, log)
+    sports_stats = sports_schedule.apply_sports_titles(playlist, progs, games)
+    log(f"  retitled {sports_stats.retitled:,} generic sports programmes; "
+        f"matchup sub-title on {sports_stats.subtitled:,} more")
+
+    # Event/PPV slots, then placeholders for other 24/7 channels with no data.
     n_placeholder_ch = 0
     ph_end = now + timedelta(days=3)
     for ch in playlist:
         if progs[ch["id"]]:
+            continue
+        blocks, source = sports_schedule.event_programmes(ch, games, now, ph_end)
+        if blocks is not None:
+            progs[ch["id"]] = blocks
+            ch["epg_source"] = source
+            if source == "event-slate":
+                sports_stats.event_from_slate += 1
+            else:
+                sports_stats.event_from_name += 1
+            game = next((p for p in blocks if not p.get("placeholder")), None)
+            if game is not None and len(sports_stats.samples) < 16:
+                when = game["start"].astimezone(TZ).strftime("%Y-%m-%d %H:%M %Z")
+                sports_stats.samples.append((ch["name"], when, game["title"]))
             continue
         if not ch["placeholder_eligible"]:
             continue
@@ -1509,6 +1533,16 @@ def main(argv: list[str] | None = None) -> int:
     lines.append("Public XMLTV sources were re-downloaded for this run." if args.refresh
                  else "Public XMLTV sources were reused from cache.")
     lines.append("Provider snapshot programmes were kept only when their start is still in the future.")
+    lines.append(f"Sports programmes retitled with a public matchup: {sports_stats.retitled:,}")
+    lines.append(f"Sports programmes given a matchup sub-title: {sports_stats.subtitled:,}")
+    lines.append(f"Event channels scheduled from the channel name: {sports_stats.event_from_name:,}")
+    lines.append("Event channels filled from that day's public slate "
+                 f"(best guess, game 1 on channel 01): {sports_stats.event_from_slate:,}")
+    if sports_stats.samples:
+        lines.append("Sample sports listings:")
+        for name, when, title in sports_stats.samples:
+            lines.append(f"  {when}  {title}")
+            lines.append(f"    {name}")
     lines.append("")
     lines.append(f"Playlist channels: {len(playlist):,}")
     lines.append(f"XML channel elements (validated): {n_ch:,}")
