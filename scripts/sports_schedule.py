@@ -9,12 +9,13 @@ league, the network, and the start time (within 30 minutes) agree.
 A programme that already has a specific title keeps it, and the matchup
 is written to sub-title.
 
-Numbered event / PPV channels are a best guess:
-  * if the channel name contains a matchup or a start time, that is used
-  * otherwise a single-league slot (NBA 01, NCAAF 03, ...) is lined up
-    with that day's games in start-time order (game 1 on channel 01)
-Programmes run from the listed start for three hours. The rest of the
-window is "No event scheduled".
+Numbered event / PPV channels:
+  * a matchup and start time in the channel name are used when that
+    start is still inside the guide window
+  * a team name, or Monday / Thursday / Sunday night, selects that game
+  * any other numbered slot lists the day's games in the description
+    ("NHL: Live Game (see description)") and does not guess which one is on
+The rest of an empty window is "No event scheduled".
 """
 
 from __future__ import annotations
@@ -644,6 +645,14 @@ def parse_named_event(name: str, now: datetime, window_start: datetime,
     return NamedEvent(title=title, start=start, source="name")
 
 
+def _cached_today(dest: Path) -> bool:
+    """Scoreboards are only reused when they were downloaded today."""
+    if not dest.exists() or dest.stat().st_size < 50:
+        return False
+    modified = datetime.fromtimestamp(dest.stat().st_mtime, TZ).date()
+    return modified == datetime.now(TZ).date()
+
+
 def _fetch_json(url: str, dest: Path, refresh: bool, timeout: int = 40) -> dict | None:
     if dest.exists() and dest.stat().st_size > 50 and not refresh:
         try:
@@ -719,7 +728,7 @@ def load_games(cache: Path, window_start: datetime, window_end: datetime,
                 url += f"&groups={groups}"
             dest = cache / "espn" / f"{lid}-{stamp}.json"
             try:
-                data = _fetch_json(url, dest, refresh)
+                data = _fetch_json(url, dest, refresh or not _cached_today(dest))
             except Exception as exc:
                 log(f"WARNING: scoreboard {label} {stamp}: {exc}")
                 continue
@@ -1112,6 +1121,84 @@ def _overlaps(start: datetime, end: datetime, prog: dict) -> bool:
     return start < prog["stop"] and prog["start"] < end
 
 
+_NET_LABEL = {
+    "espn": "ESPN", "espn2": "ESPN2", "espnu": "ESPNU", "espn-news": "ESPNews",
+    "abc": "ABC", "cbs": "CBS", "nbc": "NBC", "fox": "Fox",
+    "fs1": "FS1", "fs2": "FS2", "cbssn": "CBSSN",
+    "tnt": "TNT", "tbs": "TBS", "nfl-net": "NFL Network",
+    "nba-tv": "NBA TV", "nhl-net": "NHL Network", "mlb-net": "MLB Network",
+    "sec": "SEC Network", "acc": "ACC Network", "bigten": "Big Ten Network",
+    "prime": "Prime Video", "peacock": "Peacock", "netflix": "Netflix",
+}
+
+
+def _net_label(game: Game) -> str:
+    labels = []
+    for nid in sorted(game.networks):
+        labels.append(_NET_LABEL.get(nid, nid.upper()))
+    return ", ".join(labels)
+
+
+def slate_lines(games: list[Game]) -> str:
+    """One line per game: CT start, matchup, network, venue."""
+    lines = []
+    for game in _dedupe_games(games):
+        when = game.start.astimezone(TZ).strftime("%a %b %-d, %-I:%M %p CT")
+        line = f"{when}  {game.away} at {game.home}"
+        nets = _net_label(game)
+        if nets:
+            line += f" ({nets})"
+        if game.venue:
+            line += f" — {game.venue}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def slate_day_programmes(cid: str, games: list[Game], label: str,
+                         window_start: datetime, window_end: datetime) -> list[dict]:
+    """One block per day listing every game. Does not pick a slot's game."""
+    by_day: dict = {}
+    for game in games:
+        if game.start + timedelta(hours=3) <= window_start or game.start >= window_end:
+            continue
+        by_day.setdefault(game.start.astimezone(TZ).date(), []).append(game)
+    blocks = []
+    for day in sorted(by_day):
+        slate = _dedupe_games(by_day[day])
+        if not slate:
+            continue
+        start = min(game.start for game in slate)
+        stop = max(game.start + timedelta(hours=3) for game in slate)
+        title = f"{label}: Live Game (see description)"
+        blocks.append(_programme(cid, start, stop, title, slate_lines(slate), event=True))
+    return blocks
+
+
+def _league_for_slot(name: str) -> str | None:
+    slot = slate_slot(name)
+    if slot:
+        return slot[0]
+    label = _slot_label(name)
+    for league, pretty in _LABEL.items():
+        if pretty == label:
+            return league
+    if re.search(r"sportsnet\s*\+", name or "", re.I):
+        return "nhl"
+    return None
+
+
+def _linear_network(name: str) -> bool:
+    """A real network, not a numbered game slot."""
+    if is_numbered_event_channel(name):
+        return False
+    key = _norm(name)
+    return bool(re.search(
+        r"\b(?:nfl network|red\s*zone|nba tv|nhl network|mlb network|"
+        r"sportsnet(?!\s*\+)|tsn\b|bein sports|nbc sports|fanduel sports)\b",
+        key,
+    ))
+
+
 def event_programmes(ch: dict, games: list[Game], now: datetime,
                      window_end: datetime) -> tuple[list[dict] | None, str]:
     """Programmes for one numbered event channel, or (None, "") if it is not one.
@@ -1127,40 +1214,25 @@ def event_programmes(ch: dict, games: list[Game], now: datetime,
     chosen: list[dict] = []
     source = ""
     named = parse_named_event(name, now, window_start, window_end)
+    named_in_window = False
     if named is not None:
         stop = named.start + timedelta(hours=3)
-        if stop > window_start and named.start < window_end:
+        # Only a matchup whose start is still in the window is that channel's game.
+        # A date that has already passed does not say what is on today.
+        if (_sides(name) or " at " in (named.title or "").lower()) and stop > window_start and named.start < window_end:
             chosen.append(_programme(
-                cid, named.start, stop, named.title, named.title, event=True,
+                cid, named.start, stop, named.title,
+                named.title, event=True,
             ))
-        source = "event-name"
-    else:
-        slot = slate_slot(name)
-        if slot:
-            league, number = slot
-            by_day: dict = {}
-            for game in games:
-                if game.league != league:
-                    continue
-                stop = game.start + timedelta(hours=3)
-                if stop <= window_start or game.start >= window_end:
-                    continue
-                day = game.start.astimezone(TZ).date()
-                by_day.setdefault(day, []).append(game)
-            for day in sorted(by_day):
-                slate = by_day[day]
-                if number > len(slate):
-                    continue
-                game = slate[number - 1]
-                prog = _programme(
-                    cid, game.start, game.start + timedelta(hours=3),
-                    game.title,
-                    f"{game.title} — {game.venue}" if game.venue else game.title,
-                    sub=_sub_ok(game.title, game.venue), event=True,
-                )
-                if any(_overlaps(prog["start"], prog["stop"], prev) for prev in chosen):
-                    continue
-                chosen.append(prog)
+            named_in_window = True
+            source = "event-name"
+    if not named_in_window:
+        league = _league_for_slot(name)
+        if league:
+            chosen = slate_day_programmes(
+                cid, [g for g in games if g.league == league],
+                _LABEL.get(league, league.upper()), window_start, window_end,
+            )
             source = "event-slate"
         else:
             source = "event-name"
@@ -1276,8 +1348,9 @@ def fill_league_packages(playlist: list[dict], progs: dict[str, list[dict]],
                          stats: SportsStats) -> None:
     """Give every NBA, NHL, and NFL package channel that league's games.
 
-    A team or RSN in the channel name gets that team's game. Otherwise
-    channel 01 (or the first Sunday Ticket number) gets game 1.
+    A team name, or a Monday / Thursday / Sunday night name, gets that game.
+    A numbered slot that does not name a game lists the day's slate instead
+    of being assigned game N. Linear networks keep their public guide.
     """
     window_start = now - timedelta(hours=3)
     groups: dict[str, list[dict]] = {}
@@ -1302,7 +1375,13 @@ def fill_league_packages(playlist: list[dict], progs: dict[str, list[dict]],
             items = progs.get(ch["id"]) or []
             if any(not p.get("placeholder") and (p.get("title") or "") not in ("", "No event scheduled") for p in items):
                 with_programmes += 1
-            if _has_real_matchup(items):
+            if _linear_network(ch["name"]) and any(
+                    not p.get("placeholder") and (p.get("title") or "") not in ("", "No event scheduled")
+                    for p in items):
+                if _has_real_matchup(items):
+                    with_matchup += 1
+                continue
+            if _has_real_matchup(items) and not is_numbered_event_channel(ch["name"]):
                 with_matchup += 1
                 continue
             selected = _dedupe_games(
@@ -1314,15 +1393,16 @@ def fill_league_packages(playlist: list[dict], progs: dict[str, list[dict]],
             )
             if not selected:
                 selected = _night_games(ch["name"], games, league, window_start, window_end)
+            # A bare number is not a reliable map of game N onto channel N.
             if not selected:
-                rank = _slot_rank(ch["name"], names)
-                if rank:
-                    selected = _indexed_games(rank, games, league, window_start, window_end)
-            if not selected and not items:
-                progs[ch["id"]] = _gaps(ch["id"], [], window_start, window_end)
-                ch["epg_source"] = "league-pack"
-                continue
-            if not selected:
+                blocks = slate_day_programmes(
+                    ch["id"], [g for g in games if g.league == league],
+                    _LABEL.get(league, league.upper()), window_start, window_end,
+                )
+                if blocks:
+                    progs[ch["id"]] = _gaps(ch["id"], blocks, window_start, window_end)
+                    ch["epg_source"] = "league-slate"
+                    with_programmes += 1
                 continue
             blocks = []
             for game in selected:
@@ -1348,6 +1428,20 @@ def fill_league_packages(playlist: list[dict], progs: dict[str, list[dict]],
             "with_matchup": with_matchup,
         }
     stats.league_pack = report
+    # Centre Ice is an NHL package under a Canada group, not "USA NHL".
+    for ch in playlist:
+        if not re.search(r"cent(?:er|re)\s+ice", ch.get("name") or "", re.I):
+            continue
+        items = progs.get(ch["id"]) or []
+        if any(not p.get("placeholder") and (p.get("title") or "") not in ("", "No event scheduled") for p in items):
+            continue
+        blocks = slate_day_programmes(
+            ch["id"], [g for g in games if g.league == "nhl"], "NHL",
+            now - timedelta(hours=3), window_end,
+        )
+        if blocks:
+            progs[ch["id"]] = _gaps(ch["id"], blocks, now - timedelta(hours=3), window_end)
+            ch["epg_source"] = "league-slate"
 
 
 def add_playlist_id_aliases(playlist: list[dict], progs: dict[str, list[dict]]) -> int:
