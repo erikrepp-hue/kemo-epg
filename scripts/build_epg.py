@@ -1137,6 +1137,139 @@ def validate_xml(path: Path) -> tuple[int, int]:
     return n_ch, n_pr
 
 
+# epgshare01 US ids. "FS1 HD" and "FS1 Fox Sports 1 HD" carry the same
+# schedule; the Fox Sports 1 HD id is the one we publish.
+FS_PUBLIC = {
+    1: ("epgshare-us", "FS1.Fox.Sports.1.HD.us2"),
+    2: ("epgshare-us", "FS2.Fox.Sports.2.HD.us2"),
+}
+MOVIE_CATEGORIES = {
+    "USA Movies Channels",
+    "UK: Movies",
+    "CA: Canada Cinema",
+    "24/7 Movie Series",
+    "24/7 Movie Categories",
+}
+_PREMIUM_MOVIE = re.compile(
+    r"\b(?:hbo|cinemax|showtime|starz|encore|mgm\+|mgm plus|\bmgm\b|"
+    r"movie channel|\btmc\b|\btcm\b|\bamc\b|\bifc\b|sundance|\bfxm\b|"
+    r"hallmark|lifetime movie|sony movie|\bflix\b|sky cinema|sky movies|film4|"
+    r"epix)\b",
+    re.I,
+)
+_MOVIE_SWAPS = (
+    ("fxm", "fx movie channel"),
+    ("tcm", "turner classic movies"),
+    ("epix hits", "mgm plus hits"),
+    ("epix", "mgm plus"),
+    ("movie channel xtra", "movie channel extra"),
+    ("hallmark movies and mysteries", "hallmark mystery"),
+    ("hbo drama", "hbo signature"),
+    ("hbo hits", "hbo 2"),
+    ("hbo movies", "hbo zone"),
+    ("paramount plus with showtime", "showtime"),
+    ("star z", "starz"),
+    ("action max", "cinemax action"),
+    ("5 star max", "cinemax classics"),
+    ("more max", "cinemax hits"),
+    ("outer max", "cinemax"),
+    ("thriller max", "cinemax"),
+)
+
+
+def linear_fox_sports(name: str) -> int | None:
+    """1 or 2 for the FS1/FS2 network itself, not an event slot that mentions it."""
+    folded = normalize_name(name, keep_feed=True)
+    if folded in ("fox sports 1", "fs 1"):
+        return 1
+    if folded in ("fox sports 2", "fs 2"):
+        return 2
+    return None
+
+
+def is_movie_channel(ch: dict) -> bool:
+    if (ch.get("category") or "") in MOVIE_CATEGORIES:
+        return True
+    return bool(_PREMIUM_MOVIE.search(ch.get("name") or ""))
+
+
+def _real_programmes(ch: dict, items: list[dict]) -> int:
+    name = (ch.get("name") or "").strip()
+    count = 0
+    for prog in items or []:
+        if prog.get("placeholder"):
+            continue
+        title = (prog.get("title") or "").strip()
+        if not title or title in ("No guide data", "No event scheduled") or title == name:
+            continue
+        count += 1
+    return count
+
+
+def _movie_queries(name: str) -> list[str]:
+    seeds = [normalize_name(name, keep_feed=False), normalize_name(name, keep_feed=True)]
+    out: list[str] = []
+
+    def add(text: str) -> None:
+        text = SPACE_RE.sub(" ", text or "").strip()
+        if text and text not in out:
+            out.append(text)
+
+    for seed in seeds:
+        add(seed)
+        for src, dst in _MOVIE_SWAPS:
+            if src in seed:
+                add(seed.replace(src, dst))
+        add(seed.replace("family zone", "familyzone"))
+        if seed in ("sundance", "sundance tv"):
+            add("sundancetv")
+            add("sundance tv")
+        if "action max" in seed:
+            add("cinemax action")
+        if "encore edge" in seed:
+            add("starz edge")
+        if "hallmark drama" in seed or "hallmark family" in seed:
+            add("hallmark family")
+        if seed.startswith("epix 2") or seed.startswith("epix2"):
+            add("mgm plus hits")
+        if seed.startswith("tcm"):
+            add("tcm movies")
+    return out
+
+
+def _feed_score(playlist_name: str, source_names: list[str]) -> int:
+    blob = " ".join(source_names).lower()
+    want_west = bool(re.search(r"west|pacific", playlist_name, re.I))
+    is_west = bool(re.search(r"west|pacific", blob))
+    score = 5 if want_west == is_west else -4
+    if re.search(r"\bhd\b", blob):
+        score += 1
+    # Prefer the shorter, less-qualified feed when coasts agree.
+    score -= min(len(blob), 80) // 40
+    return score
+
+
+def find_movie_source(ch: dict, indexes: list) -> tuple[str, str] | None:
+    """Pick one public channel for a movie network, respecting east/west."""
+    if ch["region"] == "UK":
+        order = sorted(indexes, key=lambda ix: ix.kind not in ("uk", "ie"))
+    elif ch["region"] == "CA":
+        order = sorted(indexes, key=lambda ix: ix.kind != "ca")
+    else:
+        order = sorted(indexes, key=lambda ix: ix.kind not in ("us", "us-sports"))
+    best: tuple[int, str, str] | None = None
+    for ix in order:
+        for key in _movie_queries(ch["name"]):
+            ids = ix.unique(list(ix.by_norm.get(key) or []) + list(ix.by_norm_nofeed.get(key) or []))
+            for sid in ids:
+                score = _feed_score(ch["name"], ix.by_id[sid]["names"] or [sid])
+                if best is None or score > best[0]:
+                    best = (score, ix.name, sid)
+    if best is None or best[0] < 0:
+        return None
+    return best[1], best[2]
+
+
 def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser(description="Build a custom Kemo XMLTV guide")
@@ -1152,7 +1285,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="Re-download public XMLTV and logo sources (default: on)")
     ap.add_argument("--keep-xml", action="store_true",
                     help="Keep the uncompressed XML (over GitHub's 100 MB limit)")
-    ap.add_argument("--days", type=float, default=3.5, help="Hours ahead / 24 = days (default 3.5)")
+    ap.add_argument("--days", type=float, default=7, help="Days of guide to keep ahead of now (default 7)")
     args = ap.parse_args(argv)
 
     cache: Path = args.cache
@@ -1305,7 +1438,16 @@ def main(argv: list[str] | None = None) -> int:
 
         picked = None
         picked_ix = None
+        fs_slot = linear_fox_sports(name)
+        if fs_slot:
+            source_name, source_id = FS_PUBLIC[fs_slot]
+            for ix in indexes:
+                if ix.name == source_name and source_id in ix.by_id:
+                    picked, picked_ix = source_id, ix
+                    break
         for ix in ordered:
+            if picked:
+                break
             allow_fast = ix.kind == "fast"
             mid = match_in_index(name, tvg, calls, ix, allow_fast=allow_fast)
             if mid:
@@ -1334,6 +1476,13 @@ def main(argv: list[str] | None = None) -> int:
             continue
         sname, sid = pm.split(":", 1)
         incoming = (public_progs.get(sname) or {}).get(sid) or []
+        # FS1/FS2 previously matched nothing (the public ids are "FS1 HD",
+        # not "Fox Sports 1") or only a couple of generic leftovers. Use the
+        # public schedule as the guide, then let the scoreboard retitle games.
+        if linear_fox_sports(ch["name"]) and incoming:
+            progs[ch["id"]] = [dict(p) for p in incoming]
+            ch["epg_source"] = sname
+            continue
         added = 0
         for p in incoming:
             if add_programme(progs[ch["id"]], p):
@@ -1345,6 +1494,56 @@ def main(argv: list[str] | None = None) -> int:
         elif added and "+" not in ch["epg_source"] and ch["epg_source"] != sname:
             ch["epg_source"] = f"{ch['epg_source']}+{sname}"
 
+    movie_channels = [ch for ch in playlist if is_movie_channel(ch)]
+    movie_before = sum(1 for ch in movie_channels if _real_programmes(ch, progs.get(ch["id"]) or []))
+    movie_filled = 0
+    movie_missing: list[str] = []
+    extra_need: dict[str, set[str]] = defaultdict(set)
+    movie_plan: list[tuple[dict, str, str]] = []
+    for ch in movie_channels:
+        if _real_programmes(ch, progs.get(ch["id"]) or []):
+            continue
+        found = find_movie_source(ch, indexes)
+        if not found:
+            movie_missing.append(ch["name"])
+            continue
+        sname, sid = found
+        extra_need[sname].add(sid)
+        movie_plan.append((ch, sname, sid))
+    for sname, ids in extra_need.items():
+        path = path_by_name.get(sname)
+        if not path:
+            continue
+        already = public_progs.get(sname)
+        if already is None:
+            public_progs[sname] = {}
+            already = public_progs[sname]
+        missing_ids = {sid for sid in ids if sid not in already}
+        if not missing_ids:
+            continue
+        fetched = collect_programmes(path, missing_ids, window_start, window_end)
+        already.update(fetched)
+    for ch, sname, sid in movie_plan:
+        incoming = (public_progs.get(sname) or {}).get(sid) or []
+        if not incoming:
+            movie_missing.append(ch["name"])
+            continue
+        # Placeholder-only channels are replaced. Empty ones are filled.
+        progs[ch["id"]] = [dict(p) for p in incoming]
+        if ch["epg_source"] in ("none", "placeholder", ""):
+            ch["epg_source"] = sname
+        elif sname not in ch["epg_source"]:
+            ch["epg_source"] = f"{ch['epg_source']}+{sname}"
+        movie_filled += 1
+    movie_after = sum(1 for ch in movie_channels if _real_programmes(ch, progs.get(ch["id"]) or []))
+    log(f"  movie channels: {len(movie_channels):,}  real before {movie_before:,}  "
+        f"real after {movie_after:,}  newly filled {movie_filled:,}  "
+        f"still no source {len(movie_missing):,}")
+    if movie_missing:
+        shown = movie_missing[:40]
+        log("  movie channels still without a public source: " + "; ".join(shown)
+            + (f" (+{len(movie_missing) - len(shown)} more)" if len(movie_missing) > len(shown) else ""))
+
     log("Loading public scoreboards")
     games = sports_schedule.load_games(cache, window_start, window_end, args.refresh, log)
     sports_stats = sports_schedule.apply_sports_titles(playlist, progs, games)
@@ -1353,7 +1552,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Event/PPV slots, then placeholders for other 24/7 channels with no data.
     n_placeholder_ch = 0
-    ph_end = now + timedelta(days=3)
+    ph_end = window_end
     for ch in playlist:
         if progs[ch["id"]]:
             continue
@@ -1423,6 +1622,19 @@ def main(argv: list[str] | None = None) -> int:
     csv_path = outdir / "match-report.csv"
     sum_path = outdir / "SUMMARY.txt"
 
+    coverage_table: list[tuple[str, int, int, int, int]] = []
+    cov: dict[str, list[int]] = {}
+    for ch in playlist:
+        bucket = cov.setdefault(ch.get("category") or "(none)", [0, 0, 0, 0])
+        bucket[0] += 1
+        items = progs.get(ch["id"]) or []
+        if _real_programmes(ch, items):
+            bucket[1] += 1
+        elif items:
+            bucket[2] += 1
+        else:
+            bucket[3] += 1
+    coverage_table = [(cat, n, real, ph, empty) for cat, (n, real, ph, empty) in cov.items()]
     n_alias = sports_schedule.add_playlist_id_aliases(playlist, progs)
     log(f"  also publishing {n_alias:,} playlist tvg-id/name aliases so TiviMate can match either")
     log("Writing XMLTV")
@@ -1550,6 +1762,18 @@ def main(argv: list[str] | None = None) -> int:
     lines.append("ABC/NBC/CBS/FOX generic titles still left "
                  f"(Nov 25-29): {sports_stats.affiliate_generic_remaining:,}")
     lines.append(f"Title/sub-title duplicates: {sports_stats.subtitle_duplicates:,}")
+    lines.append(f"Movie channels: {len(movie_channels):,}  real before {movie_before:,}  "
+                 f"real after {movie_after:,}  still no public source {len(movie_missing):,}")
+    lines.append("Coverage by playlist category (real = a programme that is not a placeholder):")
+    lines.append(f"  {'category':<42} {'ch':>5} {'real':>5} {'ph':>5} {'empty':>5}")
+    for cat, n_cat, n_real, n_ph, n_empty in sorted(coverage_table, key=lambda row: -row[1]):
+        lines.append(f"  {cat[:42]:<42} {n_cat:5} {n_real:5} {n_ph:5} {n_empty:5}")
+    if movie_missing:
+        lines.append("Movie channels still without a public source:")
+        for missing_name in movie_missing[:80]:
+            lines.append(f"  {missing_name}")
+        if len(movie_missing) > 80:
+            lines.append(f"  (+{len(movie_missing) - 80} more)")
     lines.append(f"Event channels scheduled from the channel name: {sports_stats.event_from_name:,}")
     lines.append("Event channels filled from that day's public slate "
                  f"(best guess, game 1 on channel 01): {sports_stats.event_from_slate:,}")
