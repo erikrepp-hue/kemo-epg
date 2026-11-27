@@ -29,6 +29,8 @@ On sports networks, including every ABC, NBC, CBS, and FOX station, a generic ti
 
 NBA, NHL, and NFL package channels (the `USA NBA`, `USA NHL`, and `USA NFL - Sunday Ticket` groups) are published under both the playlist id and the channel name. A channel named for a team gets that team’s game; otherwise channel 01 gets game 1. Each game is a three-hour block, with "No event scheduled" in between.
 
+Single-show marathon channels (the `24/7` groups, and the same kind of Pluto, Samsung, Plex, Roku, and Rakuten channel) keep season and episode numbers when a public listing says which episode is on. The guide writes both `<episode-num system="xmltv_ns">` and `SxxExx`, puts the episode title in the sub-title, and starts the description with `S1 E5 · Episode Title`. A marathon with no listing for the episode stays the show name plus a short series description (seasons and years). It does not get an invented episode number.
+
 Numbered event and PPV channels (NBA 01, NCAAF 03, ESPN+ 12, and similar) are a **best-guess** mapping. If the channel name already contains a matchup or a start time, that is what airs, for three hours. Otherwise a single-league number is lined up with that day's public games in start-time order (game 1 on channel 01, game 2 on channel 02, and so on). Outside those windows the guide says "No event scheduled". Other 24/7 channels with no real schedule still get two-hour placeholders titled with the channel name.
 
 The guide is published as gzip only. The uncompressed XML is about 117 MB, over GitHub's 100 MB file limit. Daily updates amend a single `epg` commit on `main`, so the raw URL stays the same and the repository history does not grow with every build.

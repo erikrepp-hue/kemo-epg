@@ -81,6 +81,9 @@ SOURCES = [
     ("pluto-us", "pluto_us.xml",
      "https://raw.githubusercontent.com/matthuisman/i.mjh.nz/master/PlutoTV/us.xml",
      "fast"),
+    ("roku-us", "roku_all.xml",
+     "https://raw.githubusercontent.com/matthuisman/i.mjh.nz/master/Roku/all.xml",
+     "fast"),
     # More keyless public guides. Used when a real channel is still empty.
     ("epgshare-plex", "epg_ripper_PLEX1.xml.gz",
      f"{EPGSHARE}/epg_ripper_PLEX1.xml.gz", "fast"),
@@ -588,8 +591,7 @@ def programme_from_elem(elem: ET.Element) -> dict | None:
         return None
     title = desc = sub = date = ""
     cats: list[str] = []
-    episode = ""
-    ep_sys = ""
+    tagged: dict[str, str] = {}
     for child in list(elem):
         t = localname(child.tag)
         if t == "title" and not title:
@@ -602,9 +604,17 @@ def programme_from_elem(elem: ET.Element) -> dict | None:
             date = (child.text or "").strip()
         elif t == "category" and child.text:
             cats.append(child.text.strip())
-        elif t == "episode-num" and not episode and child.text:
-            episode = child.text.strip()
-            ep_sys = child.get("system") or ""
+        elif t == "episode-num" and child.text:
+            tagged[(child.get("system") or "").lower()] = child.text.strip()
+    import episode_info
+    found = episode_info.best_episode_numbers(tagged)
+    season = found[0] if found else None
+    epnum = found[1] if found else None
+    episode = ""
+    ep_sys = ""
+    if found:
+        episode = f"S{season:02d}E{epnum:02d}"
+        ep_sys = "onscreen"
     return {
         "channel": ch,
         "start_s": start_s,
@@ -618,6 +628,8 @@ def programme_from_elem(elem: ET.Element) -> dict | None:
         "cats": cats[:4],
         "episode": episode,
         "ep_sys": ep_sys,
+        "season": season,
+        "epnum": epnum,
     }
 
 
@@ -930,9 +942,10 @@ def load_playlist(channels_xml: Path) -> list[dict]:
 def load_source_channels(path: Path, name: str, kind: str) -> SourceIndex:
     idx = SourceIndex(name, kind)
     n = 0
-    # Only US_LOCALS-scale files are reliably channels-then-programmes and
-    # large enough to need an early stop. Samsung/Plex interleave them.
-    stop_early = path.stat().st_size > 20_000_000
+    # Gzipped epgshare grabs put every channel first, so a large one can stop
+    # at the first programme. Roku's plain XML interleaves each channel with
+    # its programmes, and stopping there would keep only the first channel.
+    stop_early = str(path).endswith(".gz") and path.stat().st_size > 20_000_000
     for tag, elem in iterparse_xmltv(path, stop_after_channels=stop_early):
         if tag != "channel":
             continue
@@ -1164,8 +1177,14 @@ def write_xmltv(path: Path, channels: list[dict], progs_by_id: dict[str, list[di
                     f.write(f'    <category>{escape(cat)}</category>\n')
                 if p.get("date"):
                     f.write(f'    <date>{escape(p["date"])}</date>\n')
-                if p.get("episode"):
-                    sys_attr = f' system={quoteattr(p["ep_sys"])}' if p.get("ep_sys") else ""
+                season, epnum = p.get("season"), p.get("epnum")
+                if season and epnum:
+                    f.write('    <episode-num system="xmltv_ns">'
+                            f'{int(season) - 1}.{int(epnum) - 1}.</episode-num>\n')
+                    f.write('    <episode-num system="onscreen">'
+                            f'S{int(season):02d}E{int(epnum):02d}</episode-num>\n')
+                elif p.get("episode") and p.get("ep_sys") in ("onscreen", "xmltv_ns"):
+                    sys_attr = f' system={quoteattr(p["ep_sys"])}'
                     f.write(f'    <episode-num{sys_attr}>{escape(p["episode"])}</episode-num>\n')
                 f.write("  </programme>\n")
                 count += 1
@@ -1196,6 +1215,8 @@ def make_placeholders(name: str, cid: str, start: datetime, end: datetime) -> li
             "cats": [],
             "episode": "",
             "ep_sys": "",
+            "season": None,
+            "epnum": None,
             "placeholder": True,
         })
         cur = nxt
@@ -1535,17 +1556,25 @@ def fill_remaining_gaps(playlist, progs, indexes, public_progs, path_by_name,
         found = None
         failed = ch.get("public_match") or ""
         if provider_slot(ch):
+            # "24/7 The Office" and "The Office" are the same series. Take the
+            # first FAST guide that has exactly one channel by that name.
+            # Requiring one match across every source at once dropped shows
+            # that Pluto and Plex both carry.
             key = normalize_name(ch["name"], keep_feed=False)
-            key = re.sub(r"^(?:24\s*/\s*7|24-7|24 7)\s+", "", key).strip()
-            hits = []
+            key = re.sub(r"\b(?:24\s*/\s*7|24-7|24 7)\b", " ", key)
+            key = SPACE_RE.sub(" ", key).strip()
             if len(key) >= 4:
-                for ix in indexes:
-                    for sid in ix.unique(list(ix.by_norm.get(key) or [])
-                                         + list(ix.by_norm_nofeed.get(key) or [])):
-                        if not is_affiliate_source(sid):
-                            hits.append((ix.name, sid))
-            if len({sid for _n, sid in hits}) == 1 and hits:
-                found = hits[0]
+                order = ["pluto-us", "samsung-us", "epgshare-plex", "roku-us",
+                         "epgshare-rakuten", "epgshare-distro"]
+                ranked = [ix for name in order for ix in indexes if ix.name == name]
+                ranked += [ix for ix in indexes if ix not in ranked]
+                for ix in ranked:
+                    ids = [sid for sid in ix.unique(
+                        list(ix.by_norm.get(key) or []) + list(ix.by_norm_nofeed.get(key) or []))
+                           if not is_affiliate_source(sid)]
+                    if len(ids) == 1:
+                        found = (ix.name, ids[0])
+                        break
         else:
             ordered = indexes
             if ch["region"] == "UK":
@@ -1800,6 +1829,10 @@ def main(argv: list[str] | None = None) -> int:
     need: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     for ch in playlist:
         name, tvg, calls = ch["name"], ch["tvg_id"], ch["calls"]
+        # A series title such as "Doctor Who" contains the letters of a real
+        # station (WHO-TV). Marathon channels are never local affiliates.
+        if "24/7" in f"{ch.get('category') or ''} {name}".lower() or "24-7" in (ch.get("category") or "").lower():
+            calls = set()
         # Prefer locals for US call-sign channels first, then country source, etc.
         ordered = indexes
         if ch["region"] == "UK":
@@ -1834,6 +1867,10 @@ def main(argv: list[str] | None = None) -> int:
             allow_fast = ix.kind == "fast"
             mid = match_in_index(name, tvg, calls, ix, allow_fast=allow_fast)
             if mid and national_cable(name) and is_affiliate_source(mid):
+                continue
+            if mid and is_affiliate_source(mid) and (
+                    "24/7" in f"{ch.get('category') or ''} {name}".lower()
+                    or "24-7" in (ch.get("category") or "").lower()):
                 continue
             if mid:
                 picked, picked_ix = mid, ix
@@ -1980,6 +2017,9 @@ def main(argv: list[str] | None = None) -> int:
     sports_stats.subtitle_duplicates = sub_dupes
     log(f"  ABC/NBC/CBS/FOX generic titles left Nov 25-29: {generic_left:,}; "
         f"title/sub-title duplicates: {sub_dupes:,}")
+    import episode_info
+    episode_stats = episode_info.apply_episode_numbers(
+        playlist, progs, root / "data" / "tvmaze-cache.json", log)
 
     # Inherit epg_source onto rows that share a legitimate id
     best_src: dict[str, str] = {}
@@ -2164,6 +2204,20 @@ def main(argv: list[str] | None = None) -> int:
     lines.append(f"Description/wider matchups: {len(desc_samples):,} samples "
                  f"(see log for the full added count)")
     lines.append(f"Local stations that gained a description: {local_desc_stations:,}")
+    lines.append(f"24/7 marathon channels: {episode_stats['marathon']:,}; "
+                 f"with a real episode number: {episode_stats['with_numbers']:,} "
+                 f"({episode_stats['programmes']:,} programmes); "
+                 f"series synopsis only: {episode_stats['synopsis']:,}; "
+                 f"no series match: {episode_stats['unmatched']:,}")
+    if episode_stats["samples"]:
+        lines.append("Episode samples:")
+        for sample_name, when, sample_title, code, ep_title in episode_stats["samples"]:
+            lines.append(f"  {when}  {code}  {ep_title}")
+            lines.append(f"    {sample_name}  —  {sample_title}")
+    if episode_stats["unmatched_examples"]:
+        lines.append("Marathon channels with no episode number:")
+        for sample_name, why in episode_stats["unmatched_examples"]:
+            lines.append(f"  {sample_name}: {why}")
     lines.append(f"Local stations still empty: {len(empty_locals):,}")
     if desc_samples:
         lines.append("Description fallback samples (before → after):")
