@@ -81,6 +81,19 @@ SOURCES = [
     ("pluto-us", "pluto_us.xml",
      "https://raw.githubusercontent.com/matthuisman/i.mjh.nz/master/PlutoTV/us.xml",
      "fast"),
+    # More keyless public guides. Used when a real channel is still empty.
+    ("epgshare-plex", "epg_ripper_PLEX1.xml.gz",
+     f"{EPGSHARE}/epg_ripper_PLEX1.xml.gz", "fast"),
+    ("epgshare-distro", "epg_ripper_DISTROTV1.xml.gz",
+     f"{EPGSHARE}/epg_ripper_DISTROTV1.xml.gz", "fast"),
+    ("epgshare-rakuten", "epg_ripper_RAKUTEN1.xml.gz",
+     f"{EPGSHARE}/epg_ripper_RAKUTEN1.xml.gz", "fast"),
+    ("epgshare-peacock", "epg_ripper_PEACOCK1.xml.gz",
+     f"{EPGSHARE}/epg_ripper_PEACOCK1.xml.gz", "fast"),
+    ("epgshare-bein", "epg_ripper_BEIN1.xml.gz",
+     f"{EPGSHARE}/epg_ripper_BEIN1.xml.gz", "us-sports"),
+    ("epgshare-directv-sports", "epg_ripper_DIRECTVSPORTS1.xml.gz",
+     f"{EPGSHARE}/epg_ripper_DIRECTVSPORTS1.xml.gz", "us-sports"),
 ]
 
 LOGO_ASSETS = [
@@ -96,6 +109,7 @@ CALL_BLACKLIST = {
     "WAVE", "WILD", "WIRE", "WORK", "WEEK", "WELL", "WANT", "WHAT", "WHEN",
     "WITH", "WASH", "WIND", "WOOD", "WORD", "WARM", "WISH", "WISE", "WIDE",
     "KIDS", "KNOW", "KEEP", "KIND", "KICK", "KISS", "KILN", "KILO", "KITE",
+    "KEY", "KEYS",
     "ONLY", "REAL", "TIME", "PLAY", "FOOD", "MAXX", "MAIN", "HOME", "FREE",
     "CINE", "FILM", "SPOT", "SPIKE", "HALL", "HOPE", "HERO", "HITS",
 }
@@ -272,7 +286,13 @@ def extract_call_signs(name: str, tvg_id: str = "") -> set[str]:
     # tvg-id patterns: abcwkrn.us, cbs5wtvf.us, foxwztv.us, nbc12wsfa.us, nbcwsmw.us
     tid = (tvg_id or "").lower()
     tid = re.sub(r"~\d+$", "", tid)
-    m = re.search(r"([kw][a-z]{3})(?:-dt\d?)?(?:\.[a-z0-9_]+)?$", tid)
+    # Call sign must be its own token. "cbssportsnetworkusa.us" ends in the
+    # letters kusa but is not KUSA; "nbcwkyc.us" and "cbs19woio.us" are.
+    m = re.search(
+        r"(?:^|[^a-z]|nbc|abc|cbs|fox|cw|pbs|my|ion)"
+        r"([kw][a-z]{3})(?:-?dt\d?)?(?:\.[a-z0-9_]+)?$",
+        tid,
+    )
     if m:
         c = m.group(1).upper()
         if c not in CALL_BLACKLIST:
@@ -705,10 +725,38 @@ def prefer_candidate(playlist_name: str, ids: list[str], index: SourceIndex) -> 
     return top[4]
 
 
+_NATIONAL_CABLE = re.compile(
+    r"\b(?:cbs sports|espn|espnews|fox news|fox business|fox sports|"
+    r"nbc sports|nbc news|cnbc|sec network|acc network|big ten|"
+    r"golf channel|nfl network|nba tv|nhl network|mlb network|"
+    r"longhorn|bein sports|newsmax|newsnation|news nation)\b",
+    re.I,
+)
+
+
+def national_cable(name: str) -> bool:
+    """A national network, not a local affiliate that shares a word with it."""
+    if extract_call_signs(name or ""):
+        return False
+    return bool(_NATIONAL_CABLE.search(name or ""))
+
+
+def is_affiliate_source(cid: str) -> bool:
+    return bool(re.search(
+        r"(?:^|[._-])[KW][A-Z]{3,4}(?:-?(?:DT|LD|CD|TV)\d?)?(?:\.|$)",
+        cid or "",
+    ))
+
+
 def match_in_index(name: str, tvg_id: str, calls: set[str], index: SourceIndex,
                    allow_fast: bool = False) -> str | None:
+    # A national name must never be matched by an embedded call sign
+    # ("cbssportsnetworkusa.us" is not KUSA).
+    if national_cable(name):
+        calls = set()
     # 1) exact source id equals our tvg-id
-    if tvg_id and tvg_id in index.by_id:
+    if tvg_id and tvg_id in index.by_id and not (
+            national_cable(name) and is_affiliate_source(tvg_id)):
         return tvg_id
     # 2) exact display-name (case-insensitive)
     key = fold(name).strip().lower()
@@ -724,12 +772,39 @@ def match_in_index(name: str, tvg_id: str, calls: set[str], index: SourceIndex,
             # Prefer the main DT feed, not -DT2 subchannels, unless the name
             # clearly asks for a subchannel / CW / MyNet / Charge etc.
             if cands:
+                def _src_names(cid: str) -> str:
+                    return " ".join(index.by_id[cid]["names"]).upper()
+
                 name_u = name.upper()
-                if not re.search(r"\b(?:DT\s*2|DT2|-2|TV\s*2|TV2|CW|MY\s*\d|MYNET)\b", name_u):
-                    main = [c for c in cands if not re.search(r"-(?:DT|TV)2\b", c, re.I)
-                            and not re.search(r"(?:DT|TV)\s*2", " ".join(index.by_id[c]["names"]), re.I)]
+                # The call sign on the source must be this station, not a
+                # longer sign that merely contains the same letters.
+                exact = []
+                for cid in cands:
+                    src_calls = extract_call_signs(" ".join(index.by_id[cid]["names"]), cid)
+                    if not src_calls or call in src_calls:
+                        exact.append(cid)
+                if exact:
+                    cands = exact
+                if re.search(r"\bCW\b", name_u):
+                    branded = [c for c in cands if re.search(r"\bCW\b", _src_names(c))]
+                    if branded:
+                        cands = branded
+                elif re.search(r"\bMY(?:TV|NET|NETWORK)?\b", name_u):
+                    branded = [c for c in cands if re.search(r"\bMY", _src_names(c))]
+                    if branded:
+                        cands = branded
+                wants_sub = bool(re.search(r"\b(?:DT\s*[2-9]|DT[2-9]|\.2|TV\s*2)\b", name_u))
+                if not wants_sub:
+                    main = [c for c in cands if not re.search(r"-(?:DT|TV)[2-9]\b", c, re.I)
+                            and not re.search(r"(?:DT|TV)\s*[2-9]", _src_names(c))]
                     if main:
                         cands = main
+                # Full-power DT over a low-power LD/CD sibling (WSB-DT, not WSB-LD).
+                if not re.search(r"\b(?:LD|CD|LPTV)\b", name_u):
+                    full = [c for c in cands if re.search(r"-DT(?:\.|$)", c, re.I)
+                            and not re.search(r"-DT[2-9]", c, re.I)]
+                    if full:
+                        cands = full
                 picked = prefer_candidate(name, cands, index)
                 if picked:
                     return picked
@@ -1187,6 +1262,158 @@ def linear_fox_sports(name: str) -> int | None:
     return None
 
 
+# Exact normalized names of linear networks. Event slots that merely mention
+# the network ("FS1: NCAAB ...") are longer and are not in this map.
+FORCED_LINEAR = {
+    "fox sports 1": ("epgshare-us", "FS1.Fox.Sports.1.HD.us2"),
+    "fs 1": ("epgshare-us", "FS1.Fox.Sports.1.HD.us2"),
+    "fox sports 2": ("epgshare-us", "FS2.Fox.Sports.2.HD.us2"),
+    "fs 2": ("epgshare-us", "FS2.Fox.Sports.2.HD.us2"),
+    "cbs sports network": ("epgshare-us", "CBS.Sports.Network.HD.us2"),
+    "cbs sports hq": ("epgshare-us", "CBS.Sports.HQ.us2"),
+    "espn u": ("epgshare-us", "ESPNU.HD.us2"),
+    "espnu": ("epgshare-us", "ESPNU.HD.us2"),
+    "espn 2": ("epgshare-us", "ESPN2.HD.us2"),
+    "espn2": ("epgshare-us", "ESPN2.HD.us2"),
+    "espn news": ("epgshare-us", "ESPNEWS.HD.us2"),
+    "espnews": ("epgshare-us", "ESPNEWS.HD.us2"),
+    "sec network": ("epgshare-us", "SEC.Network.HD.us2"),
+    "acc network": ("epgshare-us", "ACC.Network.us2"),
+    "big ten network": ("epgshare-us", "Big.Ten.Network.HD.us2"),
+    "btn": ("epgshare-us", "Big.Ten.Network.HD.us2"),
+    "golf channel": ("epgshare-us", "Golf.Channel.HD.us2"),
+    "fox news": ("epgshare-us", "Fox.News.Channel.HD.us2"),
+    "fox news channel": ("epgshare-us", "Fox.News.Channel.HD.us2"),
+    "fox business": ("epgshare-us", "Fox.Business.HD.us2"),
+    "fox business network": ("epgshare-us", "Fox.Business.HD.us2"),
+    "cnbc": ("epgshare-us", "CNBC.HD.us2"),
+    "espn": ("epgshare-us", "ESPN.HD.us2"),
+}
+
+
+def forced_linear(name: str) -> tuple[str, str] | None:
+    key = normalize_name(name, keep_feed=False)
+    key = _BACKUP_RE.sub(" ", key)
+    key = SPACE_RE.sub(" ", key).strip()
+    return FORCED_LINEAR.get(key)
+
+
+def provider_slot(ch: dict) -> bool:
+    """24/7 or PPV with no linear channel behind the name. Those may stay placeholders."""
+    name = ch.get("name") or ""
+    cat = ch.get("category") or ""
+    blob = f"{cat} {name}"
+    if re.search(r"24\s*/\s*7|24-7", blob, re.I):
+        return True
+    if re.search(r"\bppv\b|pay[\s-]*per[\s-]*view", blob, re.I):
+        return True
+    if EVENT_NAME_RE.search(name) and not (ch.get("calls") or extract_call_signs(name)):
+        return True
+    return False
+
+
+def broadcast_network(ch: dict) -> str | None:
+    """ABC/NBC/CBS/FOX/CW/PBS/MyNetwork for a US local station, else None."""
+    name = ch.get("name") or ""
+    cat = ch.get("category") or ""
+    if national_cable(name):
+        return None
+    if re.search(r"\b(?:FOX NEWS|FOX SPORTS|FOX BUSINESS|FS1|FS2)\b", name, re.I):
+        return None
+    m = re.search(r"USA Local\s*-\s*(NBC|ABC|CBS|FOX|CW|PBS|MY)", cat, re.I)
+    if m:
+        token = m.group(1).lower()
+        return "mynet" if token == "my" else token
+    calls = ch.get("calls") or extract_call_signs(name)
+    looks_local = cat.startswith("USA Local") or calls or bool(
+        re.search(r"\b(?:CW\d*|FOX\s*NET|MY\s*\d|MYNET)\b", name, re.I))
+    if not looks_local:
+        return None
+    blob = name.upper()
+    if re.search(r"\bPBS\b", blob):
+        return "pbs"
+    if re.search(r"\bCW\d*\b", blob):
+        return "cw"
+    if re.search(r"\bMY\b|\bMYNET\b|\bMY(?:TV|NET|NETWORK)\b", blob):
+        return "mynet"
+    if re.search(r"\bABC\b", blob):
+        return "abc"
+    if re.search(r"\bNBC\b", blob) and "NEWS NOW" not in blob:
+        return "nbc"
+    if re.search(r"\bCBS\b", blob) and "SPORTS" not in blob:
+        return "cbs"
+    if re.search(r"\bFOX\b", blob) or re.search(r"\bFOX\s*NET\b", blob):
+        return "fox"
+    if cat.startswith("USA Local") and calls:
+        return ""
+    return None
+
+
+def canada_network(ch: dict) -> str | None:
+    if ch.get("region") != "CA" or provider_slot(ch):
+        return None
+    name = ch.get("name") or ""
+    if re.search(r"news network|\bnews\b|\bsportsnet\b|\btsn\b|comedy|documentary", name, re.I):
+        return None
+    if "news" in (ch.get("tvg_id") or "").lower():
+        return None
+    if re.search(r"\bCBC\b", name):
+        return "cbc"
+    if re.search(r"\bCTV\b", name) and "NEWS" not in name.upper():
+        return "ctv"
+    if re.search(r"\bGLOBAL\b", name, re.I):
+        return "global"
+    if re.search(r"\bCITY(?:TV| TV)\b", name, re.I):
+        return "city"
+    return None
+
+
+_US_CANON_CALL = {
+    "abc": "WABC", "nbc": "WNBC", "cbs": "WCBS", "fox": "WNYW",
+    "cw": "WPIX", "pbs": "WNET", "mynet": "WWOR",
+}
+_CA_CANON_KEYS = {
+    "cbc": ("cbc toronto hd", "cbc toronto"),
+    "ctv": ("ctv toronto hd", "ctv toronto"),
+    "global": ("global toronto hd", "global toronto"),
+    "city": ("citytv toronto hd", "citytv toronto", "city tv toronto"),
+}
+_KEEP_SHOW = re.compile(
+    r"nightly news|evening news|world news tonight|\btoday\b|good morning|"
+    r"meet the press|face the nation|this week|dateline|60 minutes|20/20|"
+    r"nightline|sunday today|football night|\bnba\b|\bnfl\b|\bnhl\b|\bmlb\b|"
+    r"college|olympics",
+    re.I,
+)
+_LOCAL_NEWS = re.compile(
+    r"\bnews\b|\bnewscast\b|eyewitness|action news|newscenter|first alert|"
+    r"\d+\s*news|news\s*\d+",
+    re.I,
+)
+
+
+def _copy_feed(ch: dict, incoming: list[dict], *, local_news: bool) -> list[dict]:
+    copied = []
+    for prog in incoming:
+        item = dict(prog)
+        item["channel"] = ch["id"]
+        title = (item.get("title") or "").strip()
+        if local_news and _LOCAL_NEWS.search(title) and not _KEEP_SHOW.search(title):
+            item["title"] = "Local News"
+            item["desc"] = "Local news for this market."
+            item["sub"] = ""
+        elif not (item.get("desc") or "").strip():
+            item["desc"] = title or "Local programming"
+        copied.append(item)
+    return copied
+
+
+def _dt_id(cands: list[str]) -> str | None:
+    full = [c for c in cands if re.search(r"-DT(?:\.|$)", c, re.I)
+            and not re.search(r"-DT[2-9]", c, re.I)]
+    return full[0] if full else (cands[0] if len(cands) == 1 else None)
+
+
 def is_movie_channel(ch: dict) -> bool:
     if (ch.get("category") or "") in MOVIE_CATEGORIES:
         return True
@@ -1268,6 +1495,162 @@ def find_movie_source(ch: dict, indexes: list) -> tuple[str, str] | None:
     if best is None or best[0] < 0:
         return None
     return best[1], best[2]
+
+
+def fill_remaining_gaps(playlist, progs, indexes, public_progs, path_by_name,
+                       window_start, window_end) -> tuple[int, int, list[tuple[str, str, str]]]:
+    """Pull a public schedule for any real channel that is still empty.
+
+    24/7 and PPV slots are filled only when a public channel has that exact
+    name. Locals with no station listing get the network feed, with local
+    news labeled "Local News".
+    """
+    locals_ix = next((ix for ix in indexes if ix.kind == "us-locals"), None)
+    ca_ix = next((ix for ix in indexes if ix.kind == "ca"), None)
+    us_canon: dict[str, tuple[str, str]] = {}
+    if locals_ix is not None:
+        for net, call in _US_CANON_CALL.items():
+            sid = _dt_id(list(locals_ix.by_call.get(call) or []))
+            if sid:
+                us_canon[net] = (locals_ix.name, sid)
+    ca_canon: dict[str, tuple[str, str]] = {}
+    if ca_ix is not None:
+        for net, keys in _CA_CANON_KEYS.items():
+            for key in keys:
+                ids = ca_ix.unique(list(ca_ix.by_norm.get(key) or []))
+                if not ids:
+                    continue
+                hd = [sid for sid in ids if ".HD." in sid or sid.endswith(".HD.ca2")]
+                ca_canon[net] = (ca_ix.name, (hd or ids)[0])
+                break
+
+    gained = 0
+    fed = 0
+    plans: list[tuple[dict, str, str, str]] = []
+    for ch in playlist:
+        if _real_programmes(ch, progs.get(ch["id"]) or []):
+            continue
+        if forced_linear(ch["name"]):
+            continue
+        found = None
+        failed = ch.get("public_match") or ""
+        if provider_slot(ch):
+            key = normalize_name(ch["name"], keep_feed=False)
+            key = re.sub(r"^(?:24\s*/\s*7|24-7|24 7)\s+", "", key).strip()
+            hits = []
+            if len(key) >= 4:
+                for ix in indexes:
+                    for sid in ix.unique(list(ix.by_norm.get(key) or [])
+                                         + list(ix.by_norm_nofeed.get(key) or [])):
+                        if not is_affiliate_source(sid):
+                            hits.append((ix.name, sid))
+            if len({sid for _n, sid in hits}) == 1 and hits:
+                found = hits[0]
+        else:
+            ordered = indexes
+            if ch["region"] == "UK":
+                ordered = [ix for ix in indexes if ix.kind in ("uk", "ie")] + \
+                          [ix for ix in indexes if ix.kind not in ("uk", "ie")]
+            elif ch["region"] == "CA":
+                ordered = [ix for ix in indexes if ix.kind == "ca"] + \
+                          [ix for ix in indexes if ix.kind != "ca"]
+            for ix in ordered:
+                mid = match_in_index(ch["name"], ch.get("tvg_id") or "", ch.get("calls") or set(),
+                                     ix, allow_fast=ix.kind == "fast")
+                if mid and national_cable(ch["name"]) and is_affiliate_source(mid):
+                    continue
+                if mid and f"{ix.name}:{mid}" == failed:
+                    continue
+                if mid:
+                    found = (ix.name, mid)
+                    break
+        if found:
+            plans.append((ch, found[0], found[1], "public"))
+            continue
+        net = broadcast_network(ch)
+        canon = us_canon.get(net or "") if net else None
+        kind = "us-feed"
+        if not canon:
+            cnet = canada_network(ch)
+            canon = ca_canon.get(cnet or "") if cnet else None
+            kind = "ca-feed"
+            net = cnet
+        if canon and (net or (ch.get("category") or "").startswith("USA Local")):
+            plans.append((ch, canon[0], canon[1], kind))
+            continue
+        if (ch.get("category") or "").startswith("USA Local") or net:
+            calls = ", ".join(sorted(ch.get("calls") or [])) or "no call sign"
+            if net:
+                ch["gap_reason"] = (
+                    f"no public listing for {calls}; national {net.upper()} feed not in the sources"
+                )
+            else:
+                ch["gap_reason"] = f"no public listing for {calls} and the network is not ABC/NBC/CBS/FOX/CW/PBS/MyNetwork"
+        elif canada_network(ch):
+            ch["gap_reason"] = "no public Canadian listing and no national CBC/CTV/Global/City feed"
+    needed: dict[str, set[str]] = defaultdict(set)
+    for _ch, sname, sid, _kind in plans:
+        if sid not in public_progs.get(sname, {}):
+            needed[sname].add(sid)
+    for sname, ids in needed.items():
+        path = path_by_name.get(sname)
+        bucket = public_progs.setdefault(sname, {})
+        if not path:
+            for sid in ids:
+                bucket.setdefault(sid, [])
+            continue
+        fetched = collect_programmes(path, ids, window_start, window_end)
+        bucket.update(fetched)
+        for sid in ids:
+            bucket.setdefault(sid, [])
+    for ch, sname, sid, kind in plans:
+        incoming = (public_progs.get(sname) or {}).get(sid) or []
+        if not incoming:
+            calls = ", ".join(sorted(ch.get("calls") or [])) or "no call sign"
+            ch["gap_reason"] = f"public source {sname}:{sid} had no programmes in the window ({calls})"
+            continue
+        if kind == "public":
+            progs[ch["id"]] = [dict(p) for p in incoming]
+            ch["epg_source"] = sname
+            ch["public_match"] = f"{sname}:{sid}"
+            gained += 1
+        else:
+            progs[ch["id"]] = _copy_feed(ch, incoming, local_news=(kind == "us-feed"))
+            ch["epg_source"] = "network-feed"
+            ch["gap_reason"] = ""
+            fed += 1
+    empty: list[tuple[str, str, str]] = []
+    for ch in playlist:
+        cat = ch.get("category") or ""
+        is_local = cat.startswith("USA Local") or bool(broadcast_network(ch)) or bool(canada_network(ch))
+        if not is_local:
+            continue
+        if _real_programmes(ch, progs.get(ch["id"]) or []):
+            continue
+        empty.append((ch["name"], ch["id"], ch.get("gap_reason") or "no programmes after every public source"))
+    return gained, fed, empty
+
+
+def ensure_local_descriptions(playlist, progs) -> int:
+    """Every local station gets a description on each programme."""
+    stations = 0
+    seen: set[str] = set()
+    for ch in playlist:
+        cid = ch["id"]
+        if cid in seen:
+            continue
+        cat = ch.get("category") or ""
+        if not (cat.startswith("USA Local") or broadcast_network(ch) or canada_network(ch)):
+            continue
+        seen.add(cid)
+        changed = False
+        for prog in progs.get(cid) or []:
+            if not (prog.get("desc") or "").strip():
+                prog["desc"] = (prog.get("title") or "").strip() or "Local programming"
+                changed = True
+        if changed:
+            stations += 1
+    return stations
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1438,9 +1821,9 @@ def main(argv: list[str] | None = None) -> int:
 
         picked = None
         picked_ix = None
-        fs_slot = linear_fox_sports(name)
-        if fs_slot:
-            source_name, source_id = FS_PUBLIC[fs_slot]
+        forced = forced_linear(name)
+        if forced:
+            source_name, source_id = forced
             for ix in indexes:
                 if ix.name == source_name and source_id in ix.by_id:
                     picked, picked_ix = source_id, ix
@@ -1450,6 +1833,8 @@ def main(argv: list[str] | None = None) -> int:
                 break
             allow_fast = ix.kind == "fast"
             mid = match_in_index(name, tvg, calls, ix, allow_fast=allow_fast)
+            if mid and national_cable(name) and is_affiliate_source(mid):
+                continue
             if mid:
                 picked, picked_ix = mid, ix
                 break
@@ -1476,10 +1861,9 @@ def main(argv: list[str] | None = None) -> int:
             continue
         sname, sid = pm.split(":", 1)
         incoming = (public_progs.get(sname) or {}).get(sid) or []
-        # FS1/FS2 previously matched nothing (the public ids are "FS1 HD",
-        # not "Fox Sports 1") or only a couple of generic leftovers. Use the
-        # public schedule as the guide, then let the scoreboard retitle games.
-        if linear_fox_sports(ch["name"]) and incoming:
+        # Forced linear networks (FS1, CBSSN, ESPNU, ...) replace a bad
+        # affiliate match or an empty guide with the public channel.
+        if forced_linear(ch["name"]) and incoming:
             progs[ch["id"]] = [dict(p) for p in incoming]
             ch["epg_source"] = sname
             continue
@@ -1544,11 +1928,22 @@ def main(argv: list[str] | None = None) -> int:
         log("  movie channels still without a public source: " + "; ".join(shown)
             + (f" (+{len(movie_missing) - len(shown)} more)" if len(movie_missing) > len(shown) else ""))
 
+    gap_gained, gap_fed, empty_locals = fill_remaining_gaps(
+        playlist, progs, indexes, public_progs, path_by_name, window_start, window_end)
+    log(f"  gap fill: {gap_gained:,} real channels gained a public schedule; "
+        f"{gap_fed:,} locals used a network feed; {len(empty_locals):,} locals still empty")
+
     log("Loading public scoreboards")
     games = sports_schedule.load_games(cache, window_start, window_end, args.refresh, log)
     sports_stats = sports_schedule.apply_sports_titles(playlist, progs, games)
     log(f"  retitled {sports_stats.retitled:,} generic sports programmes; "
         f"matchup sub-title on {sports_stats.subtitled:,} more")
+    desc_samples = sports_schedule.apply_description_matchups(
+        playlist, progs, games, cache, args.refresh, log)
+    golf_samples = sports_schedule.apply_golf(
+        playlist, progs, cache, args.refresh, log)
+    local_desc_stations = ensure_local_descriptions(playlist, progs)
+    log(f"  local stations that gained descriptions: {local_desc_stations:,}")
 
     # Event/PPV slots, then placeholders for other 24/7 channels with no data.
     n_placeholder_ch = 0
@@ -1764,6 +2159,27 @@ def main(argv: list[str] | None = None) -> int:
     lines.append(f"Title/sub-title duplicates: {sports_stats.subtitle_duplicates:,}")
     lines.append(f"Movie channels: {len(movie_channels):,}  real before {movie_before:,}  "
                  f"real after {movie_after:,}  still no public source {len(movie_missing):,}")
+    lines.append(f"Gap fill from public listings: {gap_gained:,} channels; "
+                 f"network-feed locals: {gap_fed:,}")
+    lines.append(f"Description/wider matchups: {len(desc_samples):,} samples "
+                 f"(see log for the full added count)")
+    lines.append(f"Local stations that gained a description: {local_desc_stations:,}")
+    lines.append(f"Local stations still empty: {len(empty_locals):,}")
+    if desc_samples:
+        lines.append("Description fallback samples (before → after):")
+        for sample_name, when, before, after in desc_samples[:8]:
+            lines.append(f"  {when}  {before}  →  {after}")
+            lines.append(f"    {sample_name}")
+    if golf_samples:
+        lines.append("Golf listings (before → after):")
+        for sample_name, when, before_t, after_t, before_d, after_d in golf_samples[:6]:
+            lines.append(f"  {when}  {before_t}  →  {after_t}")
+            lines.append(f"    {sample_name}")
+            lines.append(f"    desc: {after_d}")
+    if empty_locals:
+        lines.append("Local stations still empty:")
+        for sample_name, sample_id, reason in empty_locals:
+            lines.append(f"  {sample_name}  id={sample_id}  {reason}")
     lines.append("Coverage by playlist category (real = a programme that is not a placeholder):")
     lines.append(f"  {'category':<42} {'ch':>5} {'real':>5} {'ph':>5} {'empty':>5}")
     for cat, n_cat, n_real, n_ph, n_empty in sorted(coverage_table, key=lambda row: -row[1]):

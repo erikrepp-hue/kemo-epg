@@ -270,6 +270,7 @@ class Game:
     home: str
     venue: str
     networks: set[str] = field(default_factory=set)
+    neutral: bool = False
 
     @property
     def matchup(self) -> str:
@@ -700,7 +701,7 @@ def _game_from_event(event: dict, league: str, label: str) -> Game | None:
         nets |= network_ids(name)
     venue = ((comp.get("venue") or {}).get("fullName") or "").strip()
     return Game(league=league, label=label, start=start, away=away, home=home,
-                venue=venue, networks=nets)
+                venue=venue, networks=nets, neutral=bool(comp.get("neutralSite")))
 
 
 def load_games(cache: Path, window_start: datetime, window_end: datetime,
@@ -836,13 +837,13 @@ def _game_on_channel(game: Game, networks: set[str], channel_name: str) -> bool:
 
 def match_games(networks: set[str], league: str | None, start: datetime,
                 stop: datetime | None, games: list[Game], channel_name: str = "",
-                *, allow_any_league: bool = False) -> list[Game]:
-    """Games on this network within 60 minutes of the listing, or inside it."""
+                *, allow_any_league: bool = False, minutes: int = 60) -> list[Game]:
+    """Games on this network within `minutes` of the listing, or inside it."""
     if start is None or not networks:
         return []
     if league is None and not allow_any_league:
         return []
-    window = timedelta(minutes=60)
+    window = timedelta(minutes=minutes)
     found: list[Game] = []
     seen: set[tuple] = set()
     for game in games:
@@ -1291,6 +1292,13 @@ def fill_league_packages(playlist: list[dict], progs: dict[str, list[dict]],
         with_matchup = 0
         with_programmes = 0
         for ch in members:
+            # A shared junk tvg-id (USA NHL 18 stored as a Myrtle Beach NBC id)
+            # must not overwrite that local station. Publish the package under
+            # its display name instead.
+            if any(other is not ch and other.get("id") == ch["id"]
+                   and not package_league(other.get("category") or "")
+                   for other in playlist):
+                ch["id"] = ch["name"]
             items = progs.get(ch["id"]) or []
             if any(not p.get("placeholder") and (p.get("title") or "") not in ("", "No event scheduled") for p in items):
                 with_programmes += 1
@@ -1361,6 +1369,12 @@ def add_playlist_id_aliases(playlist: list[dict], progs: dict[str, list[dict]]) 
         if ch.get("name") and ch["name"] != ch["id"]:
             aliases.append(ch["name"])
         for alias in aliases:
+            # Never copy a package slate onto an id another station already uses.
+            foreign = [other for other in playlist
+                       if other is not ch and other.get("id") == alias
+                       and not package_league(other.get("category") or "")]
+            if foreign:
+                continue
             if alias in seen:
                 if not progs.get(alias) and progs.get(ch["id"]):
                     progs[alias] = list(progs[ch["id"]])
@@ -1372,3 +1386,406 @@ def add_playlist_id_aliases(playlist: list[dict], progs: dict[str, list[dict]]) 
             progs[alias] = list(progs.get(ch["id"]) or [])
     playlist.extend(extras)
     return len(extras)
+
+
+_TEAM_FEEDS = (
+    ("basketball", "mens-college-basketball", "ncaam"),
+    ("basketball", "womens-college-basketball", "ncaaw"),
+    ("football", "college-football", "ncaaf"),
+    ("basketball", "nba", "nba"),
+    ("football", "nfl", "nfl"),
+    ("hockey", "nhl", "nhl"),
+    ("baseball", "mlb", "mlb"),
+)
+_LEAGUE_LABEL = {
+    "ncaam": "NCAAB", "ncaaw": "NCAAW", "ncaaf": "NCAAF",
+    "nba": "NBA", "nfl": "NFL", "nhl": "NHL", "mlb": "MLB",
+    "wnba": "WNBA", "mls": "MLS", "epl": "EPL",
+}
+_MEET_TEAMS = re.compile(
+    r"\b(?:[Tt]he\s+)?([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,3})\s*"
+    r"\(\s*\d+\s*[-–]\s*\d+\s*\)\s+and\s+(?:[Tt]he\s+)?"
+    r"([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,3})\s*"
+    r"\(\s*\d+\s*[-–]\s*\d+\s*\)"
+)
+_HOST_TEAMS = re.compile(
+    r"\b([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,3})\s+hosts?\s+"
+    r"([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,3})"
+)
+_FACE_TEAMS = re.compile(
+    r"\b([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,3})\s+faces?\s+"
+    r"([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,3})"
+)
+_VS_TEAMS = re.compile(
+    r"\b([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,3})\s+vs\.?\s+"
+    r"([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,3})"
+)
+_AT_TEAMS = re.compile(
+    r"\b([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,3})\s+at\s+"
+    r"([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,3})"
+)
+_VISIT_TEAMS = re.compile(
+    r"\b(?:[Tt]he\s+)?([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,4})\s+visits?\s+"
+    r"(?:[Tt]he\s+)?(?:No\.\s*\d+\s+)?([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,4})"
+)
+_ARENA = re.compile(
+    r"\bat\s+([A-Z][\w'&.-]+(?:\s+[A-Z][\w'&.-]+){0,6}"
+    r"(?:Arena|Stadium|Center|Centre|Field|Coliseum|Garden|Dome|Park|Pavilion))"
+)
+
+
+def load_team_index(cache: Path, refresh: bool, log) -> dict[tuple[str, str], list[str]]:
+    """Mascot/nickname → display names, per league. Public ESPN team lists."""
+    index: dict[tuple[str, str], list[str]] = {}
+    for sport, league, lid in _TEAM_FEEDS:
+        url = (f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/teams"
+               "?limit=1000")
+        dest = cache / "espn" / f"teams-{lid}.json"
+        try:
+            data = _fetch_json(url, dest, refresh)
+        except Exception as exc:
+            log(f"WARNING: team list {lid}: {exc}")
+            continue
+        if not data:
+            continue
+        teams = []
+        for sport_row in data.get("sports") or []:
+            for league_row in sport_row.get("leagues") or []:
+                teams.extend(league_row.get("teams") or [])
+        for row in teams:
+            team = row.get("team") or {}
+            display = (team.get("displayName") or "").strip()
+            if not display:
+                continue
+            tokens = {
+                (team.get("name") or "").strip(),
+                (team.get("nickname") or "").strip(),
+                display.split()[-1] if display.split() else "",
+            }
+            for token in tokens:
+                key = token.lower()
+                if len(key) < 4:
+                    continue
+                bucket = index.setdefault((lid, key), [])
+                if display not in bucket:
+                    bucket.append(display)
+    log(f"  team nicknames indexed: {len(index):,}")
+    return index
+
+
+def _resolve_side(token: str, league: str, index: dict[tuple[str, str], list[str]]) -> str | None:
+    parts = [p for p in token.split() if p.lower() not in {"no.", "the"}]
+    tries = [token.strip()]
+    if len(parts) >= 2:
+        tries.append(" ".join(parts[-2:]))
+    if parts:
+        tries.append(parts[-1])
+    ambiguous = ""
+    for cand in tries:
+        hits = index.get((league, cand.lower())) or []
+        if len(hits) == 1:
+            return hits[0]
+        if hits and not ambiguous:
+            ambiguous = cand.strip()
+    # Ambiguous mascot (Eagles, Tigers): keep the nickname, still confident.
+    return ambiguous or None
+
+
+def _parse_desc_teams(desc: str) -> tuple[str, str, str] | None:
+    """(left, right, 'vs'|'at') from a listing description, or None."""
+    text = desc or ""
+    m = _MEET_TEAMS.search(text)
+    if m:
+        return m.group(1), m.group(2), "vs"
+    m = _HOST_TEAMS.search(text)
+    if m:
+        # "X host Y" → Y at X
+        return m.group(2), m.group(1), "at"
+    m = _FACE_TEAMS.search(text)
+    if m:
+        return m.group(1), m.group(2), "vs"
+    m = _VS_TEAMS.search(text)
+    if m:
+        return m.group(1), m.group(2), "vs"
+    m = _VISIT_TEAMS.search(text)
+    if m:
+        return m.group(1), m.group(2), "at"
+    m = _AT_TEAMS.search(text)
+    if m:
+        return m.group(1), m.group(2), "at"
+    return None
+
+
+def _game_for_names(games: list[Game], league: str, a: str, b: str) -> Game | None:
+    def hit(game: Game) -> bool:
+        sides = (game.away.lower(), game.home.lower())
+        a_l, b_l = a.lower(), b.lower()
+        pair = (
+            (a_l in sides[0] or sides[0] in a_l) and (b_l in sides[1] or sides[1] in b_l)
+        ) or (
+            (b_l in sides[0] or sides[0] in b_l) and (a_l in sides[1] or sides[1] in a_l)
+        )
+        return pair
+    found = [g for g in games if g.league == league and hit(g)]
+    keys = {(g.away, g.home) for g in found}
+    if len(keys) == 1:
+        return found[0]
+    return None
+
+
+def apply_description_matchups(playlist: list[dict], progs: dict[str, list[dict]],
+                               games: list[Game], cache: Path, refresh: bool,
+                               log) -> list[tuple[str, str, str, str]]:
+    """Retitle a generic game from a wider scoreboard window or its description.
+
+    The description text is left as it is. The sub-title is the venue or blank.
+    Returns (channel, when CT, before, after) samples.
+    """
+    index = load_team_index(cache, refresh, log)
+    samples: list[tuple[str, str, str, str]] = []
+    count = 0
+    seen: set[str] = set()
+    for ch in playlist:
+        cid = ch["id"]
+        if cid in seen:
+            continue
+        seen.add(cid)
+        nets = network_ids(ch["name"])
+        for prog in progs.get(cid) or []:
+            if prog.get("placeholder"):
+                continue
+            before = (prog.get("title") or "").strip()
+            leagues = candidate_leagues(before)
+            if not leagues:
+                continue
+            found: list[Game] = []
+            if nets:
+                for league in leagues:
+                    found.extend(match_games(
+                        nets, league, prog.get("start"), prog.get("stop"), games,
+                        ch["name"], minutes=180,
+                    ))
+            if found:
+                if len(leagues) > 1:
+                    found.sort(key=lambda g: abs((g.start - prog["start"]).total_seconds()))
+                    best = found[0].league
+                    found = [g for g in found if g.league == best]
+                chosen = choose_games(found, ch["name"])
+                if not chosen:
+                    continue
+                updated = _retitle(prog, chosen)
+                if updated["title"] == before:
+                    continue
+                prog.update(updated)
+                count += 1
+                if len(samples) < 8:
+                    when = prog["start"].astimezone(TZ).strftime("%Y-%m-%d %H:%M %Z")
+                    samples.append((ch["name"], when, before, prog["title"]))
+                continue
+            parsed = _parse_desc_teams(prog.get("desc") or "")
+            if not parsed:
+                continue
+            left_raw, right_raw, style = parsed
+            titled = None
+            venue = ""
+            for league in leagues:
+                left = _resolve_side(left_raw, league, index)
+                right = _resolve_side(right_raw, league, index)
+                if not left or not right:
+                    continue
+                game = _game_for_names(games, league, left, right)
+                label = _LEAGUE_LABEL.get(league, league.upper())
+                if game is not None:
+                    if game.neutral or style == "vs":
+                        titled = f"{label}: {game.away} vs {game.home}"
+                    else:
+                        titled = f"{label}: {game.away} at {game.home}"
+                    venue = game.venue
+                else:
+                    titled = f"{label}: {left} {style} {right}"
+                break
+            if not titled or titled.lower() == before.lower():
+                continue
+            if not venue:
+                arena = _ARENA.search(prog.get("desc") or "")
+                venue = arena.group(1) if arena else ""
+            prog["title"] = titled
+            prog["sub"] = _sub_ok(titled, venue)
+            # Description stays as the listing wrote it.
+            count += 1
+            when = prog["start"].astimezone(TZ).strftime("%Y-%m-%d %H:%M %Z")
+            if len(samples) < 8 or (before.lower() == "college basketball" and "fs1" in ch["name"].lower()):
+                if len(samples) < 12:
+                    samples.append((ch["name"], when, before, titled))
+    log(f"  description/wider-window matchups added: {count:,}")
+    return samples
+
+
+_GOLF_TOURS = (
+    ("pga", "PGA Tour", ("pga tour", "pga championship", "masters", "u.s. open", "us open", "the open")),
+    ("eur", "DP World Tour", ("dp world", "european tour", "dp world tour")),
+    ("lpga", "LPGA", ("lpga",)),
+    ("liv", "LIV Golf", ("liv golf", "liv ")),
+    ("ntw", "Korn Ferry Tour", ("korn ferry",)),
+)
+_GOLF_GENERIC = re.compile(
+    r"^(?:live[:\s-]*)?(?:"
+    r"golf|pga tour(?: golf)?|lpga(?: tour)?(?: golf)?|liv golf|"
+    r"korn ferry(?: tour)?(?: golf)?|dp world tour(?: golf)?|"
+    r"european tour(?: golf)?|champions tour(?: golf)?"
+    r")$",
+    re.I,
+)
+
+
+def _golf_course(cache: Path, refresh: bool, tour: str, event_id: str) -> tuple[str, str]:
+    url = f"https://sports.core.api.espn.com/v2/sports/golf/leagues/{tour}/events/{event_id}"
+    dest = cache / "espn" / f"golf-{tour}-{event_id}.json"
+    data = _fetch_json(url, dest, refresh)
+    if not data:
+        return "", ""
+    courses = data.get("courses") or []
+    if not courses:
+        return "", ""
+    course = courses[0]
+    name = (course.get("name") or "").strip()
+    addr = course.get("address") or {}
+    city = (addr.get("city") or "").strip()
+    state = (addr.get("state") or "").strip()
+    country = (addr.get("country") or "").strip()
+    if state and country and country not in ("USA", "United States"):
+        where = ", ".join(p for p in (city, f"{state}, {country}") if p)
+    elif state:
+        where = ", ".join(p for p in (city, state) if p)
+    else:
+        where = ", ".join(p for p in (city, country) if p)
+    return name, where
+
+
+def load_golf_events(cache: Path, refresh: bool, log) -> list[dict]:
+    events = []
+    for tour, label, _keys in _GOLF_TOURS:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/golf/{tour}/scoreboard"
+        dest = cache / "espn" / f"golf-{tour}.json"
+        try:
+            data = _fetch_json(url, dest, refresh)
+        except Exception as exc:
+            log(f"WARNING: golf {tour}: {exc}")
+            continue
+        if not data:
+            continue
+        for ev in data.get("events") or []:
+            eid = str(ev.get("id") or "")
+            name = (ev.get("name") or ev.get("shortName") or "").strip()
+            if not eid or not name:
+                continue
+            try:
+                start = datetime.fromisoformat((ev.get("date") or "").replace("Z", "+00:00"))
+                end = datetime.fromisoformat((ev.get("endDate") or ev.get("date") or "").replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            try:
+                course, where = _golf_course(cache, refresh, tour, eid)
+            except Exception as exc:
+                log(f"WARNING: golf course {tour} {eid}: {exc}")
+                course, where = "", ""
+            broadcasts = []
+            for comp in ev.get("competitions") or []:
+                for cast in comp.get("broadcasts") or []:
+                    broadcasts.extend(cast.get("names") or [])
+            events.append({
+                "tour": tour, "label": label, "name": name,
+                "start": start, "end": end, "course": course, "where": where,
+                "broadcasts": " ".join(broadcasts).lower(),
+            })
+    log(f"  golf events: {len(events):,}")
+    return events
+
+
+def _golf_location(event: dict) -> str:
+    course = event.get("course") or ""
+    where = event.get("where") or ""
+    text = ", ".join(p for p in (course, where) if p)
+    return f"Location: {text}." if text else ""
+
+
+def apply_golf(playlist: list[dict], progs: dict[str, list[dict]],
+               cache: Path, refresh: bool, log) -> list[tuple[str, str, str, str, str, str]]:
+    """Put the course and city on golf listings, and name a generic title."""
+    events = load_golf_events(cache, refresh, log)
+    samples: list[tuple[str, str, str, str, str, str]] = []
+    titled = 0
+    located = 0
+    seen: set[str] = set()
+    for ch in playlist:
+        cid = ch["id"]
+        if cid in seen:
+            continue
+        seen.add(cid)
+        channel_blob = (ch.get("name") or "").lower()
+        for prog in progs.get(cid) or []:
+            if prog.get("placeholder"):
+                continue
+            title = (prog.get("title") or "").strip()
+            desc = prog.get("desc") or ""
+            # Match the title or the channel. A description that merely
+            # contains "Liv" or the word "golf" is not a golf listing.
+            title_l = title.lower()
+            blob = f"{title_l} {desc.lower()}"
+            if not (
+                re.search(r"\bgolf\b", f"{title_l} {channel_blob}")
+                or re.search(r"\b(?:pga|lpga|korn ferry|dp world|liv golf)\b", title_l)
+            ):
+                continue
+            start = prog.get("start")
+            if start is None:
+                continue
+            overlapping = [ev for ev in events if ev["start"] <= start <= ev["end"]]
+            if not overlapping:
+                continue
+            chosen = None
+            for _tour, label, keys in _GOLF_TOURS:
+                if any(k in blob for k in keys):
+                    tour_hits = [ev for ev in overlapping if ev["label"] == label]
+                    if len(tour_hits) == 1:
+                        chosen = tour_hits[0]
+                        break
+            if chosen is None and len(overlapping) == 1:
+                chosen = overlapping[0]
+            if chosen is None and "golf" in channel_blob:
+                aired = [ev for ev in overlapping if "golf" in ev["broadcasts"]]
+                if len(aired) == 1:
+                    chosen = aired[0]
+            if chosen is None and overlapping:
+                chosen = max(overlapping, key=lambda ev: ev["start"])
+            if chosen is not None:
+                keys = next(k for _t, label, k in _GOLF_TOURS if label == chosen["label"])
+                mentions = any(k in blob for k in keys) or chosen["name"].lower() in blob
+                generic = bool(_GOLF_GENERIC.match(_core_title(title)))
+                # A show that names a different tour, or isn't a tournament listing,
+                # does not inherit another event's course.
+                if not mentions and not generic:
+                    chosen = None
+                elif generic and chosen["name"].lower() not in (desc or "").lower():
+                    if re.search(r"\b(?:championship|classic|open|invitational|cup)\b",
+                                 desc or "", re.I):
+                        chosen = None
+            if chosen is None:
+                continue
+            before_title, before_desc = title, desc
+            core = _core_title(title)
+            if _GOLF_GENERIC.match(core):
+                prog["title"] = f"{chosen['label']}: {chosen['name']}"
+                prog["sub"] = _sub_ok(prog["title"], chosen.get("course") or "")
+                titled += 1
+            loc = _golf_location(chosen)
+            if loc and not (prog.get("desc") or "").lower().lstrip().startswith("location:"):
+                existing = (prog.get("desc") or "").strip()
+                prog["desc"] = f"{loc} {existing}".strip() if existing else loc
+                located += 1
+            if len(samples) < 8 and (before_title != prog["title"] or before_desc != prog.get("desc")):
+                when = start.astimezone(TZ).strftime("%Y-%m-%d %H:%M %Z")
+                samples.append((ch["name"], when, before_title, prog["title"],
+                                before_desc[:180], (prog.get("desc") or "")[:180]))
+    log(f"  golf titles set: {titled:,}; golf locations added: {located:,}")
+    return samples
