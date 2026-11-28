@@ -2022,6 +2022,9 @@ def main(argv: list[str] | None = None) -> int:
     n_placeholder_ch = 0
     ph_end = window_end
     for ch in playlist:
+        # Event and league-pass rows are left out so TiviMate uses the provider guide.
+        if sports_schedule.provider_owns(ch):
+            continue
         if progs[ch["id"]]:
             continue
         blocks, source = sports_schedule.event_programmes(ch, games, now, ph_end)
@@ -2108,8 +2111,11 @@ def main(argv: list[str] | None = None) -> int:
     coverage_table = [(cat, n, real, ph, empty) for cat, (n, real, ph, empty) in cov.items()]
     n_alias = sports_schedule.add_playlist_id_aliases(playlist, progs)
     log(f"  also publishing {n_alias:,} playlist tvg-id/name aliases so TiviMate can match either")
+    published = [ch for ch in playlist if not sports_schedule.provider_owns(ch)]
+    n_omitted = len(playlist) - len(published)
+    log(f"  leaving {n_omitted:,} event/league-pass channels out for the provider guide")
     log("Writing XMLTV")
-    write_xmltv(xml_path, playlist, progs, "Kemo custom EPG (snapshot)")
+    write_xmltv(xml_path, published, progs, "Kemo custom EPG (snapshot)")
 
     log("Compressing")
     # mtime=0 so an unchanged guide produces the same gzip bytes.
@@ -2142,8 +2148,8 @@ def main(argv: list[str] | None = None) -> int:
         log(f"ERROR: compressed guide is not valid XMLTV: {e}")
         return 1
     log(f"  well-formed: {n_ch:,} channels, {n_pr:,} programmes")
-    if n_ch != len(playlist) or n_pr < 1:
-        log(f"ERROR: expected {len(playlist):,} channels and at least one programme")
+    if n_ch != len(published) or n_pr < 1:
+        log(f"ERROR: expected {len(published):,} channels and at least one programme")
         return 1
     if not args.keep_xml:
         xml_path.unlink()

@@ -1206,7 +1206,7 @@ def event_programmes(ch: dict, games: list[Game], now: datetime,
     The source tag is "event-name" or "event-slate".
     """
     name = ch["name"]
-    if not is_numbered_event_channel(name):
+    if provider_owns(ch) or not is_numbered_event_channel(name):
         return None, ""
     cid = ch["id"]
     # Same lookback as the rest of the guide, so a game already underway is kept.
@@ -1243,6 +1243,72 @@ _PACKAGE_LEAGUE = {
     "usa nba": "nba",
     "usa nhl": "nhl",
 }
+
+
+# Whole groups that are provider event / league-pass slots. TiviMate uses the
+# provider's own guide for these, so this file must not publish them.
+_PROVIDER_CATEGORIES = {
+    "CA: Sportsnet +",
+    "Sport NCAA Men Basketball",
+    "Sport NCAA Women Basketball",
+    "Sport NJCAA Men Basketball",
+    "Sport NJCAA Women Basketball",
+    "Sport Lacrosse",
+    "Sport Match Center",
+    "Sport Golf",
+    "Sport Tennis",
+    "Sport Cycling",
+    "PPV FLOSPORTS",
+    "Pay Per View Events",
+    "PPV-MMA/BOXING/WWE/UFC",
+    "Sports DAZN",
+    "USA NCAAF",
+    "USA WNBA",
+}
+_PACKAGE_CATEGORIES = {
+    "USA NBA",
+    "USA NHL",
+    "USA NFL - Sunday Ticket",
+    "USA MLB",
+}
+# Linear networks that stay in the guide even when they sit in a package group.
+_LINEAR_KEEP = re.compile(
+    r"(?i)\b(?:nfl network|red\s*zone|nba tv|nhl network|mlb network|mlb strike zone|"
+    r"espn\s*2|(?<![a-z+])espn(?!\s*\+)|fox sports\s*[12]|\bfs\s*[12]\b|"
+    r"\btnt\b|\btbs\b|cbs sports|espn\s*u|sec network|acc network|"
+    r"big ten|\bbtn\b|\btsn\s*[1-5]\b|bein sports)\b"
+)
+
+
+def provider_owns(ch: dict) -> bool:
+    """True when this channel is left out so the provider guide can fill it.
+
+    No channel element and no programmes are written. Linear networks stay.
+    """
+    name = ch.get("name") or ""
+    category = ch.get("category") or ""
+    if category in _PROVIDER_CATEGORIES:
+        return True
+    if re.search(r"espn\s*\+|espn\s+plus", name, re.I):
+        return True
+    if re.search(r"(?i)(?:^|[^a-z])ppv(?:[^a-z]|$)|\bpay\s*per\s*view\b", name):
+        return True
+    if re.search(r"(?i)\bpeacock\s+\d{1,3}\b", name):
+        return True
+    if re.search(r"(?i)\bdazn\b", name) and re.search(r"\d", name):
+        return True
+    if re.search(r"(?i)cent(?:er|re)\s+ice", name):
+        return True
+    if re.search(r"(?i)\b(?:soccer|cricket|golf|tennis|cycling|lacrosse)\s*0?\d{1,3}\b", name):
+        return True
+    if re.search(r"(?i)\b(?:ncaa|njcaa)\b.{0,40}\b\d{1,3}\b", name) and re.search(
+            r"(?i)baseball|softball|basketball", name):
+        return True
+    if re.search(r"(?i)premier league replay\s+\d", name):
+        return True
+    if category in _PACKAGE_CATEGORIES and not _LINEAR_KEEP.search(name):
+        return True
+    return False
 
 
 def package_league(category: str) -> str | None:
@@ -1355,6 +1421,8 @@ def fill_league_packages(playlist: list[dict], progs: dict[str, list[dict]],
     window_start = now - timedelta(hours=3)
     groups: dict[str, list[dict]] = {}
     for ch in playlist:
+        if provider_owns(ch):
+            continue
         league = package_league(ch.get("category") or "")
         if league:
             groups.setdefault(ch["category"], []).append(ch)
@@ -1430,7 +1498,7 @@ def fill_league_packages(playlist: list[dict], progs: dict[str, list[dict]],
     stats.league_pack = report
     # Centre Ice is an NHL package under a Canada group, not "USA NHL".
     for ch in playlist:
-        if not re.search(r"cent(?:er|re)\s+ice", ch.get("name") or "", re.I):
+        if provider_owns(ch) or not re.search(r"cent(?:er|re)\s+ice", ch.get("name") or "", re.I):
             continue
         items = progs.get(ch["id"]) or []
         if any(not p.get("placeholder") and (p.get("title") or "") not in ("", "No event scheduled") for p in items):
@@ -1454,7 +1522,7 @@ def add_playlist_id_aliases(playlist: list[dict], progs: dict[str, list[dict]]) 
     seen = {ch["id"] for ch in playlist}
     extras = []
     for ch in playlist:
-        if not package_league(ch.get("category") or ""):
+        if provider_owns(ch) or not package_league(ch.get("category") or ""):
             continue
         aliases = []
         raw = re.sub(r"~\d+$", "", ch.get("stored_id") or "")
